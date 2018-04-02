@@ -1487,12 +1487,12 @@ void Platform::Spin()
 			// Check for stalled drivers that need to be reported and logged
 			if (stalledDriversToLog != 0 && reprap.GetGCodes().IsReallyPrinting())
 			{
-				scratchString.Clear();
-				ListDrivers(scratchString, stalledDriversToLog);
+				String<ScratchStringLength> scratchString;
+				ListDrivers(scratchString.GetRef(), stalledDriversToLog);
 				stalledDriversToLog = 0;
 				float liveCoordinates[DRIVES];
 				reprap.GetMove().LiveCoordinates(liveCoordinates, reprap.GetCurrentXAxes(), reprap.GetCurrentYAxes());
-				MessageF(WarningMessage, "Driver(s)%s stalled at Z height %.2f", scratchString.Pointer(), (double)liveCoordinates[Z_AXIS]);
+				MessageF(WarningMessage, "Driver(s)%s stalled at Z height %.2f", scratchString.c_str(), (double)liveCoordinates[Z_AXIS]);
 				reported = true;
 			}
 #endif
@@ -1596,6 +1596,7 @@ void Platform::ReportDrivers(MessageType mt, DriversBitmap whichDrivers, const c
 {
 	if (whichDrivers != 0)
 	{
+		String<ScratchStringLength> scratchString;
 		scratchString.printf("%s on drivers", text);
 		for (unsigned int drive = 0; whichDrivers != 0; ++drive)
 		{
@@ -1605,7 +1606,7 @@ void Platform::ReportDrivers(MessageType mt, DriversBitmap whichDrivers, const c
 			}
 			whichDrivers >>= 1;
 		}
-		MessageF(mt, "%s\n", scratchString.Pointer());
+		MessageF(mt, "%s\n", scratchString.c_str());
 		reported = true;
 	}
 }
@@ -2133,6 +2134,7 @@ void Platform::Diagnostics(MessageType mtype)
 														: (reason == (uint32_t)SoftwareResetReason::wdtFault) ? "Watchdog timeout"
 															: (reason == (uint32_t)SoftwareResetReason::otherFault) ? "Other fault"
 																: "Unknown";
+			String<ScratchStringLength> scratchString;
 			if (srdBuf[slot].when != 0)
 			{
 				const time_t when = (time_t)srdBuf[slot].when;
@@ -2146,7 +2148,7 @@ void Platform::Diagnostics(MessageType mtype)
 			}
 
 			MessageF(mtype, "Last software reset %s, reason: %s%s, spinning module %s, available RAM %" PRIu32 " bytes (slot %d)\n",
-								scratchString.Pointer(),
+								scratchString.c_str(),
 								(srdBuf[slot].resetReason & (uint32_t)SoftwareResetReason::deliberate) ? "deliberate " : "",
 								reasonText, moduleName[srdBuf[slot].resetReason & 0x0F], srdBuf[slot].neverUsedRam, slot);
 			// Our format buffer is only 256 characters long, so the next 2 lines must be written separately
@@ -2160,7 +2162,7 @@ void Platform::Diagnostics(MessageType mtype)
 				{
 					scratchString.catf(" %08" PRIx32, srdBuf[slot].stack[i]);
 				}
-				MessageF(mtype, "Stack:%s\n", scratchString.Pointer());
+				MessageF(mtype, "Stack:%s\n", scratchString.c_str());
 			}
 		}
 		else
@@ -2741,6 +2743,7 @@ bool Platform::WriteAxisLimits(FileStore *f, AxesBitmap axesProbed, const float 
 		return true;
 	}
 
+	String<ScratchStringLength> scratchString;
 	scratchString.printf("M208 S%d", sParam);
 	for (size_t axis = 0; axis < MaxAxes; ++axis)
 	{
@@ -2750,7 +2753,7 @@ bool Platform::WriteAxisLimits(FileStore *f, AxesBitmap axesProbed, const float 
 		}
 	}
 	scratchString.cat('\n');
-	return f->Write(scratchString.Pointer());
+	return f->Write(scratchString.c_str());
 }
 
 // This is called from the step ISR as well as other places, so keep it fast
@@ -3575,16 +3578,16 @@ void Platform::MessageF(MessageType type, const char *fmt, va_list vargs)
 	if ((type & ErrorMessageFlag) != 0)
 	{
 		formatString.copy("Error: ");
-		formatString.GetRef().vcatf(fmt, vargs);
+		formatString.vcatf(fmt, vargs);
 	}
 	else if ((type & WarningMessageFlag) != 0)
 	{
 		formatString.copy("Warning: ");
-		formatString.GetRef().vcatf(fmt, vargs);
+		formatString.vcatf(fmt, vargs);
 	}
 	else
 	{
-		formatString.GetRef().vprintf(fmt, vargs);
+		formatString.vprintf(fmt, vargs);
 	}
 
 	RawMessage((MessageType)(type & ~(ErrorMessageFlag | WarningMessageFlag)), formatString.c_str());
