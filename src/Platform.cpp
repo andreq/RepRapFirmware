@@ -180,13 +180,6 @@ Platform::Platform() :
 #endif
 		lastFanCheckTime(0), auxGCodeReply(nullptr), tickState(0), debugCode(0), lastWarningMillis(0), deliberateError(false), i2cInitialised(false)
 {
-	// Output
-	auxOutput = new OutputStack();
-#ifdef SERIAL_AUX2_DEVICE
-	aux2Output = new OutputStack();
-#endif
-	usbOutput = new OutputStack();
-
 	// Files
 	massStorage = new MassStorage(this);
 }
@@ -1110,7 +1103,7 @@ void Platform::SendAuxMessage(const char* msg)
 		buf->copy("{\"message\":");
 		buf->EncodeString(msg, strlen(msg), false, true);
 		buf->cat("}\n");
-		auxOutput->Push(buf);
+		auxOutput.Push(buf);
 		FlushAuxMessages();
 	}
 }
@@ -1188,7 +1181,7 @@ bool Platform::FlushAuxMessages()
 {
 	// Write non-blocking data to the AUX line
 	MutexLocker lock(auxMutex);
-	OutputBuffer *auxOutputBuffer = auxOutput->GetFirstItem();
+	OutputBuffer *auxOutputBuffer = auxOutput.GetFirstItem();
 	if (auxOutputBuffer != nullptr)
 	{
 		const size_t bytesToWrite = min<size_t>(SERIAL_AUX_DEVICE.canWrite(), auxOutputBuffer->BytesLeft());
@@ -1200,10 +1193,10 @@ bool Platform::FlushAuxMessages()
 		if (auxOutputBuffer->BytesLeft() == 0)
 		{
 			auxOutputBuffer = OutputBuffer::Release(auxOutputBuffer);
-			auxOutput->SetFirstItem(auxOutputBuffer);
+			auxOutput.SetFirstItem(auxOutputBuffer);
 		}
 	}
-	return auxOutput->GetFirstItem() != nullptr;
+	return auxOutput.GetFirstItem() != nullptr;
 }
 
 // Flush messages to USB and aux, returning true if there is more to send
@@ -1216,7 +1209,7 @@ bool Platform::FlushMessages()
 	bool aux2hasMore;
 	{
 		MutexLocker lock(aux2MutexHandle);
-		OutputBuffer *aux2OutputBuffer = aux2Output->GetFirstItem();
+		OutputBuffer *aux2OutputBuffer = aux2Output.GetFirstItem();
 		if (aux2OutputBuffer != nullptr)
 		{
 			size_t bytesToWrite = min<size_t>(SERIAL_AUX2_DEVICE.canWrite(), aux2OutputBuffer->BytesLeft());
@@ -1228,10 +1221,10 @@ bool Platform::FlushMessages()
 			if (aux2OutputBuffer->BytesLeft() == 0)
 			{
 				aux2OutputBuffer = OutputBuffer::Release(aux2OutputBuffer);
-				aux2Output->SetFirstItem(aux2OutputBuffer);
+				aux2Output.SetFirstItem(aux2OutputBuffer);
 			}
 		}
-		aux2hasMore = (aux2Output->GetFirstItem() != nullptr);
+		aux2hasMore = (aux2Output.GetFirstItem() != nullptr);
 	}
 #endif
 
@@ -1239,14 +1232,14 @@ bool Platform::FlushMessages()
 	bool usbHasMore;
 	{
 		MutexLocker lock(usbMutex);
-		OutputBuffer *usbOutputBuffer = usbOutput->GetFirstItem();
+		OutputBuffer *usbOutputBuffer = usbOutput.GetFirstItem();
 		if (usbOutputBuffer != nullptr)
 		{
 			if (!SERIAL_MAIN_DEVICE)
 			{
 				// If the USB port is not opened, free the data left for writing
 				OutputBuffer::ReleaseAll(usbOutputBuffer);
-				usbOutput->SetFirstItem(nullptr);
+				usbOutput.SetFirstItem(nullptr);
 			}
 			else
 			{
@@ -1260,11 +1253,11 @@ bool Platform::FlushMessages()
 				if (usbOutputBuffer->BytesLeft() == 0 || usbOutputBuffer->GetAge() > SERIAL_MAIN_TIMEOUT)
 				{
 					usbOutputBuffer = OutputBuffer::Release(usbOutputBuffer);
-					usbOutput->SetFirstItem(usbOutputBuffer);
+					usbOutput.SetFirstItem(usbOutputBuffer);
 				}
 			}
 		}
-		usbHasMore = (usbOutput->GetFirstItem() != nullptr);
+		usbHasMore = (usbOutput.GetFirstItem() != nullptr);
 	}
 
 	return auxHasMore
@@ -2021,23 +2014,6 @@ void Platform::Diagnostics(MessageType mtype)
 
 	Message(mtype, "=== Platform ===\n");
 
-	// Print the firmware version and board type
-	MessageF(mtype, "%s version %s running on %s", FIRMWARE_NAME, VERSION, GetElectronicsString());
-
-#ifdef DUET_NG
-	const char* const expansionName = DuetExpansion::GetExpansionBoardName();
-	if (expansionName != nullptr)
-	{
-		MessageF(mtype, " + %s", expansionName);
-	}
-#endif
-
-	Message(mtype, "\n");
-
-#if SAM4E || SAM4S || SAME70
-	PrintUniqueId(mtype);
-#endif
-
 	// Show the up time and reason for the last reset
 	const uint32_t now = (uint32_t)(millis64()/1000u);		// get up time in seconds
 	const char* resetReasons[8] = { "power up", "backup", "watchdog", "software",
@@ -2130,9 +2106,6 @@ void Platform::Diagnostics(MessageType mtype)
 			Message(mtype, "Last software reset details not available\n");
 		}
 	}
-
-	// Show the used and free buffer counts
-	OutputBuffer::Diagnostics(mtype);
 
 	// Show the current error codes
 	MessageF(mtype, "Error status: %" PRIu32 "\n", errorCodeBits);
@@ -3292,7 +3265,7 @@ void Platform::AppendAuxReply(const char *msg, bool rawMessage)
 			if (OutputBuffer::Allocate(buf))
 			{
 				buf->copy(msg);
-				auxOutput->Push(buf);
+				auxOutput.Push(buf);
 			}
 		}
 		else
@@ -3321,7 +3294,7 @@ void Platform::AppendAuxReply(OutputBuffer *reply, bool rawMessage)
 		{
 			// JSON responses are always sent directly to the AUX device
 			// For big responses it makes sense to write big chunks of data in portions. Store this data here
-			auxOutput->Push(reply);
+			auxOutput.Push(reply);
 		}
 		else
 		{
@@ -3373,10 +3346,10 @@ void Platform::RawMessage(MessageType type, const char *message)
 #ifdef SERIAL_AUX2_DEVICE
 		MutexLocker lock(aux2Mutex);
 		// Message that is to be sent to the second auxiliary device (blocking)
-		if (!aux2Output->IsEmpty())
+		if (!aux2Output.IsEmpty())
 		{
 			// If we're still busy sending a response to the USART device, append this message to the output buffer
-			aux2Output->GetLastItem()->cat(message);
+			aux2Output.GetLastItem()->cat(message);
 		}
 		else
 		{
@@ -3410,7 +3383,7 @@ void Platform::RawMessage(MessageType type, const char *message)
 #endif
 		{
 			// Ensure we have a valid buffer to write to that isn't referenced for other destinations
-			OutputBuffer *usbOutputBuffer = usbOutput->GetLastItem();
+			OutputBuffer *usbOutputBuffer = usbOutput.GetLastItem();
 			if (usbOutputBuffer == nullptr || usbOutputBuffer->IsReferenced())
 			{
 				if (!OutputBuffer::Allocate(usbOutputBuffer))
@@ -3418,7 +3391,7 @@ void Platform::RawMessage(MessageType type, const char *message)
 					// Should never happen
 					return;
 				}
-				usbOutput->Push(usbOutputBuffer);
+				usbOutput.Push(usbOutputBuffer);
 			}
 
 			// Append the message string
@@ -3492,7 +3465,7 @@ void Platform::Message(const MessageType type, OutputBuffer *buffer)
 		{
 			// Send this message to the second UART device
 			MutexLocker lock(aux2Mutex);
-			aux2Output->Push(buffer);
+			aux2Output.Push(buffer);
 		}
 #endif
 
@@ -3511,7 +3484,7 @@ void Platform::Message(const MessageType type, OutputBuffer *buffer)
 			else
 			{
 				// Else append incoming data to the stack
-				usbOutput->Push(buffer);
+				usbOutput.Push(buffer);
 			}
 		}
 	}
