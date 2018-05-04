@@ -24,6 +24,7 @@ void ZProbe::Init(float h)
 	tolerance = DefaultZProbeTolerance;
 	maxTaps = DefaultZProbeTaps;
 	invertReading = turnHeatersOff = false;
+	eEndstop = 0;
 }
 
 float ZProbe::GetStopHeight(float temperature) const
@@ -33,7 +34,7 @@ float ZProbe::GetStopHeight(float temperature) const
 
 bool ZProbe::WriteParameters(FileStore *f, unsigned int probeType) const
 {
-	scratchString.printf("G31 T%u P%" PRIu32 " X%.1f Y%.1f Z%.2f\n", probeType, adcValue, (double)xOffset, (double)yOffset, (double)triggerHeight);
+	scratchString.printf("G31 T%u P%" PRIu32 " X%.1f Y%.1f Z%.2f E%u\n", probeType, adcValue, (double)xOffset, (double)yOffset, (double)triggerHeight, eEndstop);
 	return f->Write(scratchString.Pointer());
 }
 
