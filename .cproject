@@ -729,9 +729,11 @@
 	<storageModule moduleId="refreshScope" versionNumber="2">
 		<configuration configurationName="DuetM_RTOS"/>
 		<configuration configurationName="Alligator"/>
+		<configuration configurationName="SAME70_RTOS"/>
 		<configuration configurationName="SAME70"/>
-		<configuration configurationName="Duet2"/>
 		<configuration configurationName="RADDS"/>
+		<configuration configurationName="Duet2_RTOS"/>
+		<configuration configurationName="Duet2"/>
 		<configuration configurationName="DuetM"/>
 		<configuration configurationName="Duet085"/>
 	</storageModule>
