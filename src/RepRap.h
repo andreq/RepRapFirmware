@@ -23,6 +23,7 @@ Licence: GPL
 
 #include "RepRapFirmware.h"
 #include "MessageType.h"
+#include "RTOSIface.h"
 
 enum class ResponseSource
 {
@@ -40,6 +41,7 @@ public:
 	void Spin();
 	void Exit();
 	void Diagnostics(MessageType mtype);
+	void DeferredDiagnostics(MessageType mtype) { diagnosticsDestination = mtype; }
 	void Timing(MessageType mtype);
 
 	bool Debug(Module module) const;
@@ -65,7 +67,6 @@ public:
 	const Tool* GetFirstTool() const { return toolList; }				// Return the lowest-numbered tool
 	uint32_t GetCurrentXAxes() const;									// Get the current axes used as X axes
 	uint32_t GetCurrentYAxes() const;									// Get the current axes used as Y axes
-	void SetToolVariables(int toolNumber, const float* standbyTemperatures, const float* activeTemperatures);
 	bool IsHeaterAssignedToTool(int8_t heater) const;
 	unsigned int GetNumberOfContiguousTools() const;
 
@@ -100,8 +101,9 @@ public:
 	OutputBuffer *GetStatusResponse(uint8_t type, ResponseSource source);
 	OutputBuffer *GetConfigResponse();
 	OutputBuffer *GetLegacyStatusResponse(uint8_t type, int seq);
-	OutputBuffer *GetFilesResponse(const char* dir, bool flagsDirs);
-	OutputBuffer *GetFilelistResponse(const char* dir);
+	OutputBuffer *GetFilesResponse(const char* dir, unsigned int startAt, bool flagsDirs);
+	OutputBuffer *GetFilelistResponse(const char* dir, unsigned int startAt);
+	bool GetFileInfoResponse(const char *filename, OutputBuffer *&response, bool quitEarly);
 
 	void Beep(unsigned int freq, unsigned int ms);
 	void SetMessage(const char *msg);
@@ -140,6 +142,7 @@ private:
  	Display *display;
 #endif
 
+ 	Mutex toolListMutex, messageBoxMutex;
 	Tool* toolList;								// the tool list is sorted in order of increasing tool number
 	Tool* currentTool;
 	uint32_t lastWarningMillis;					// When we last sent a warning message for things that can happen very often
@@ -150,7 +153,6 @@ private:
 	uint16_t ticksInSpinState;
 	Module spinningModule;
 	uint32_t fastLoop, slowLoop;
-	uint32_t lastTime;
 
 	uint32_t debug;
 	bool stopped;
@@ -171,6 +173,9 @@ private:
 	uint32_t boxSeq;
 	uint32_t boxTimer, boxTimeout;
 	AxesBitmap boxControls;
+
+	// Deferred diagnostics
+	MessageType diagnosticsDestination;
 };
 
 inline Platform& RepRap::GetPlatform() const { return *platform; }

@@ -125,10 +125,12 @@ public:
 
 		uint8_t isFirmwareRetraction : 1;								// true if this is a firmware retraction/un-retraction move
 		uint8_t usePressureAdvance : 1;									// true if we want to us extruder pressure advance, if there is any extrusion
-		uint8_t canPauseBefore : 1;										// true if we can pause before this move
 		uint8_t canPauseAfter : 1;										// true if we can pause just after this move and successfully restart
 		uint8_t hasExtrusion : 1;										// true if the move includes extrusion - only valid if the move was set up by SetupMove
 		uint8_t isCoordinated : 1;										// true if this is a coordinates move
+		uint8_t usingStandardFeedrate : 1;								// true if this move uses the standard feed rate
+
+		void SetDefaults();												// set up default values
 	};
   
 	GCodes(Platform& p);
@@ -143,6 +145,7 @@ public:
 	void GetCurrentCoordinates(const StringRef& s) const;				// Write where we are into a string
 	bool DoingFileMacro() const;										// Or still busy processing a macro file?
 	float FractionOfFilePrinted() const;								// Get fraction of file printed
+	FilePosition GetFilePosition() const;								// Return the current position of the file being printed in bytes
 	void Diagnostics(MessageType mtype);								// Send helpful information out
 
 	bool RunConfigFile(const char* fileName);							// Start running the config file
@@ -155,15 +158,18 @@ public:
 	void SetAxisNotHomed(unsigned int axis)								// Tell us that the axis is not homed
 		{ ClearBit(axesHomed, axis); }
 
-	float GetSpeedFactor() const { return speedFactor * MinutesToSeconds; }	// Return the current speed factor
-	float GetExtrusionFactor(size_t extruder) { return extrusionFactors[extruder]; } // Return the current extrusion factors
+	float GetSpeedFactor() const;										// Return the current speed factor
+	void SetSpeedFactor(float factor);									// Set the speed factor
+	float GetExtrusionFactor(size_t extruder);							// Return the current extrusion factors
+	void SetExtrusionFactor(size_t extruder, float factor);				// Set an extrusion factor
+
 	float GetRawExtruderTotalByDrive(size_t extruder) const;			// Get the total extrusion since start of print, for one drive
 	float GetTotalRawExtrusion() const { return rawExtruderTotal; }		// Get the total extrusion since start of print, all drives
 	float GetBabyStepOffset() const { return currentBabyStepZOffset; }	// Get the current baby stepping Z offset
 	const float *GetUserPosition() const { return currentUserPosition; }	// Return the current user position
 
-	RegularGCodeInput *GetHTTPInput() const { return httpInput; }
-	RegularGCodeInput *GetTelnetInput() const { return telnetInput; }
+	NetworkGCodeInput *GetHTTPInput() const { return httpInput; }
+	NetworkGCodeInput *GetTelnetInput() const { return telnetInput; }
 
 	void WriteGCodeToFile(GCodeBuffer& gb);								// Write this GCode into a file
 	void WriteHTMLToFile(GCodeBuffer& gb, char b);						// Save an HTML file (usually to upload a new web interface)
@@ -177,6 +183,7 @@ public:
 	bool IsReallyPrinting() const;										// Return true if we are printing from SD card and not pausing, paused or resuming
 	bool IsSimulating() const { return simulationMode != 0; }
 	bool IsDoingToolChange() const { return doingToolChange; }
+	bool IsHeatingUp() const;											// Return true if the SD card print is waiting for a heater to reach temperature
 
 	bool AllAxesAreHomed() const;										// Return true if all axes are homed
 
@@ -202,12 +209,19 @@ public:
 #endif
 
 	const char *GetAxisLetters() const { return axisLetters; }			// Return a null-terminated string of axis letters indexed by drive
-
-	const float GetSpindleRpm() const { return spindleRpm; }
+	MachineType GetMachineType() const { return machineType; }
 
 #if SUPPORT_12864_LCD
 	bool ProcessCommandFromLcd(const char *cmd);						// Process a GCode command from the 12864 LCD returning true if the command was accepted
+	float GetItemCurrentTemperature(unsigned int itemNumber) const;
+	float GetItemActiveTemperature(unsigned int itemNumber) const;
+	float GetItemStandbyTemperature(unsigned int itemNumber) const;
+	void SetItemActiveTemperature(unsigned int itemNumber, float temp);
+	void SetItemStandbyTemperature(unsigned int itemNumber, float temp);
+	float GetMappedFanSpeed() const { return lastDefaultFanSpeed; }		// Get the mapped fan speed
 #endif
+
+	void SetMappedFanSpeed(float f);									// Set the mapped fan speed
 
 private:
 	GCodes(const GCodes&);												// private copy constructor to prevent copying
@@ -247,41 +261,41 @@ private:
 	bool HandleMcode(GCodeBuffer& gb, const StringRef& reply);			// Do an M code
 	bool HandleTcode(GCodeBuffer& gb, const StringRef& reply);			// Do a T code
 	bool HandleResult(GCodeBuffer& gb, GCodeResult rslt, const StringRef& reply);
-	void HandleReply(GCodeBuffer& gb, bool error, const char *reply);	// Handle G-Code replies
+	void HandleReply(GCodeBuffer& gb, GCodeResult rslt, const char *reply);		// Handle G-Code replies
 	void HandleReply(GCodeBuffer& gb, bool error, OutputBuffer *reply);
 
 	const char* DoStraightMove(GCodeBuffer& gb, bool isCoordinated) __attribute__((hot));	// Execute a straight move returning any error message
-	const char* DoArcMove(GCodeBuffer& gb, bool clockwise)				// Execute an arc move returning any error message
+	const char* DoArcMove(GCodeBuffer& gb, bool clockwise)						// Execute an arc move returning any error message
 		pre(segmentsLeft == 0; resourceOwners[MoveResource] == &gb);
-	void FinaliseMove(const GCodeBuffer& gb);							// Adjust the move parameters to account for segmentation and/or part of the move having been done already
-	bool CheckEnoughAxesHomed(AxesBitmap axesMoved);					// Check that enough axes have been homed
-	void AbortPrint(GCodeBuffer& gb);									// Cancel any print in progress
+	void FinaliseMove(GCodeBuffer& gb);											// Adjust the move parameters to account for segmentation and/or part of the move having been done already
+	bool CheckEnoughAxesHomed(AxesBitmap axesMoved);							// Check that enough axes have been homed
+	void AbortPrint(GCodeBuffer& gb);											// Cancel any print in progress
 
-	GCodeResult DoDwell(GCodeBuffer& gb);								// Wait for a bit
-	GCodeResult DoDwellTime(GCodeBuffer& gb, uint32_t dwellMillis);		// Really wait for a bit
-	GCodeResult DoHome(GCodeBuffer& gb, const StringRef& reply);		// Home some axes
-	GCodeResult ExecuteG30(GCodeBuffer& gb, const StringRef& reply);	// Probes at a given position - see the comment at the head of the function itself
-	void InitialiseTaps();												// Set up to do the first of a possibly multi-tap probe
-	void SetBedEquationWithProbe(int sParam, const StringRef& reply);	// Probes a series of points and sets the bed equation
+	GCodeResult DoDwell(GCodeBuffer& gb);										// Wait for a bit
+	GCodeResult DoDwellTime(GCodeBuffer& gb, uint32_t dwellMillis);				// Really wait for a bit
+	GCodeResult DoHome(GCodeBuffer& gb, const StringRef& reply);				// Home some axes
+	GCodeResult ExecuteG30(GCodeBuffer& gb, const StringRef& reply);			// Probes at a given position - see the comment at the head of the function itself
+	void InitialiseTaps();														// Set up to do the first of a possibly multi-tap probe
+	void SetBedEquationWithProbe(int sParam, const StringRef& reply);			// Probes a series of points and sets the bed equation
 	GCodeResult SetPrintZProbe(GCodeBuffer& gb, const StringRef& reply);		// Either return the probe value, or set its threshold
 	GCodeResult SetOrReportOffsets(GCodeBuffer& gb, const StringRef& reply);	// Deal with a G10
-	GCodeResult SetPositions(GCodeBuffer& gb);								// Deal with a G92
-	GCodeResult DoDriveMapping(GCodeBuffer& gb, const StringRef& reply);	// Deal with a M584
-	GCodeResult ProbeTool(GCodeBuffer& gb, const StringRef& reply);			// Deal with a M585
-	GCodeResult SetDateTime(GCodeBuffer& gb,const  StringRef& reply);		// Deal with a M905
-	GCodeResult SavePosition(GCodeBuffer& gb,const  StringRef& reply);		// Deal with G60
+	GCodeResult SetPositions(GCodeBuffer& gb);									// Deal with a G92
+	GCodeResult DoDriveMapping(GCodeBuffer& gb, const StringRef& reply);		// Deal with a M584
+	GCodeResult ProbeTool(GCodeBuffer& gb, const StringRef& reply);				// Deal with a M585
+	GCodeResult SetDateTime(GCodeBuffer& gb,const  StringRef& reply);			// Deal with a M905
+	GCodeResult SavePosition(GCodeBuffer& gb,const  StringRef& reply);			// Deal with G60
 
-	bool LoadExtrusionAndFeedrateFromGCode(GCodeBuffer& gb, int moveType); // Set up the extrusion and feed rate of a move for the Move class
+	bool LoadExtrusionAndFeedrateFromGCode(GCodeBuffer& gb);					// Set up the extrusion of a move
 
-	bool Push(GCodeBuffer& gb);											// Push feedrate etc on the stack
-	void Pop(GCodeBuffer& gb);											// Pop feedrate etc
-	void DisableDrives();												// Turn the motors off
+	bool Push(GCodeBuffer& gb);													// Push feedrate etc on the stack
+	void Pop(GCodeBuffer& gb);													// Pop feedrate etc
+	void DisableDrives();														// Turn the motors off
 	bool OpenFileToWrite(GCodeBuffer& gb, const char* directory, const char* fileName, const FilePosition size, const bool binaryWrite, const uint32_t fileCRC32);
-																		// Start saving GCodes in a file
-	void FinishWrite(GCodeBuffer& gb);									// Finish writing to the file and respond
-	bool SendConfigToLine();											// Deal with M503
+																				// Start saving GCodes in a file
+	void FinishWrite(GCodeBuffer& gb);											// Finish writing to the file and respond
+	bool SendConfigToLine();													// Deal with M503
 
-	GCodeResult OffsetAxes(GCodeBuffer& gb);							// Set offsets
+	GCodeResult OffsetAxes(GCodeBuffer& gb, const StringRef& reply);			// Set/report offsets
 
 #if SUPPORT_WORKPLACE_COORDINATES
 	GCodeResult GetSetWorkplaceCoordinates(GCodeBuffer& gb, const StringRef& reply, bool compute);	// Set workspace coordinates
@@ -293,6 +307,7 @@ private:
 	bool ManageTool(GCodeBuffer& gb, const StringRef& reply);					// Create a new tool definition, returning true if an error was reported
 	void SetToolHeaters(Tool *tool, float temperature, bool both);				// Set all a tool's heaters to the temperature, for M104/M109
 	bool ToolHeatersAtSetTemperatures(const Tool *tool, bool waitWhenCooling) const; // Wait for the heaters associated with the specified tool to reach their set temperatures
+	void ReportToolTemperatures(const StringRef& reply, const Tool *tool, bool includeNumber) const;
 	void GenerateTemperatureReport(const StringRef& reply) const;				// Store a standard-format temperature report in reply
 	OutputBuffer *GenerateJsonStatusResponse(int type, int seq, ResponseSource source) const;	// Generate a M408 response
 	void CheckReportDue(GCodeBuffer& gb, const StringRef& reply) const;			// Check whether we need to report temperatures or status
@@ -309,7 +324,7 @@ private:
 	GCodeResult RetractFilament(GCodeBuffer& gb, bool retract);					// Retract or un-retract filaments
 	GCodeResult LoadFilament(GCodeBuffer& gb, const StringRef& reply);			// Load the specified filament into a tool
 	GCodeResult UnloadFilament(GCodeBuffer& gb, const StringRef& reply);		// Unload the current filament from a tool
-	bool ChangeMicrostepping(size_t drive, unsigned int microsteps, int mode) const;	// Change microstepping on the specified drive
+	bool ChangeMicrostepping(size_t drive, unsigned int microsteps, bool interp) const; // Change microstepping on the specified drive
 	void ListTriggers(const StringRef& reply, TriggerInputsBitmap mask);		// Append a list of trigger inputs to a message
 	void CheckTriggers();														// Check for and execute triggers
 	void CheckFilament();														// Check for and respond to filament errors
@@ -328,21 +343,24 @@ private:
 
 	GCodeResult SetOrReportZProbe(GCodeBuffer& gb, const StringRef &reply);		// Handle M558
 	GCodeResult DefineGrid(GCodeBuffer& gb, const StringRef &reply);			// Define the probing grid, returning true if error
-	bool LoadHeightMap(GCodeBuffer& gb, const StringRef& reply) const;			// Load the height map from file
+	GCodeResult LoadHeightMap(GCodeBuffer& gb, const StringRef& reply);			// Load the height map from file
 	bool SaveHeightMap(GCodeBuffer& gb, const StringRef& reply) const;			// Save the height map to file
+	void ClearBedMapping();														// Stop using bed compensation
 	GCodeResult ProbeGrid(GCodeBuffer& gb, const StringRef& reply);				// Start probing the grid, returning true if we didn't because of an error
 	GCodeResult CheckOrConfigureTrigger(GCodeBuffer& gb, const StringRef& reply, int code);	// Handle M581 and M582
 	GCodeResult UpdateFirmware(GCodeBuffer& gb, const StringRef &reply);		// Handle M997
 	GCodeResult SendI2c(GCodeBuffer& gb, const StringRef &reply);				// Handle M260
 	GCodeResult ReceiveI2c(GCodeBuffer& gb, const StringRef &reply);			// Handle M261
+	GCodeResult SimulateFile(GCodeBuffer& gb, const StringRef &reply, const StringRef& file, bool updateFile);	// Handle M37 to simulate a whole file
+	GCodeResult ChangeSimulationMode(GCodeBuffer& gb, const StringRef &reply, uint32_t newSimulationMode);		// Handle M37 to change the simulation mode
 
-	bool WriteConfigOverrideFile(GCodeBuffer& gb, const StringRef& reply, const char *fileName) const; // Write the config-override file
-	void CopyConfigFinalValues(GCodeBuffer& gb);						// Copy the feed rate etc. from the daemon to the input channels
+	GCodeResult WriteConfigOverrideFile(GCodeBuffer& gb, const StringRef& reply) const; // Write the config-override file
+	void CopyConfigFinalValues(GCodeBuffer& gb);							// Copy the feed rate etc. from the daemon to the input channels
 
 	void ClearBabyStepping() { currentBabyStepZOffset = 0.0; }
 
-	MessageType GetMessageBoxDevice(GCodeBuffer& gb) const;				// Decide which device to display a message box on
-	void DoManualProbe(GCodeBuffer& gb);								// Do a manual bed probe
+	MessageType GetMessageBoxDevice(GCodeBuffer& gb) const;					// Decide which device to display a message box on
+	void DoManualProbe(GCodeBuffer& gb);									// Do a manual bed probe
 
 	void AppendAxes(const StringRef& reply, AxesBitmap axes) const;			// Append a list of axes to a string
 
@@ -353,10 +371,17 @@ private:
 
 	const char* GetMachineModeString() const;							// Get the name of the current machine mode
 
+	void NewMoveAvailable(unsigned int sl);								// Flag that a new move is available
+	void NewMoveAvailable();											// Flag that a new move is available
+
+#if SUPPORT_12864_LCD
+	int GetHeaterNumber(unsigned int itemNumber) const;
+#endif
+
 	Platform& platform;													// The RepRap machine
 
-	RegularGCodeInput* httpInput;										// These cache incoming G-codes...
-	RegularGCodeInput* telnetInput;										// ...
+	NetworkGCodeInput* httpInput;										// These cache incoming G-codes...
+	NetworkGCodeInput* telnetInput;										// ...
 	FileGCodeInput* fileInput;											// ...
 	StreamGCodeInput* serialInput;										// ...
 	StreamGCodeInput* auxInput;											// ...for the GCodeBuffers below
@@ -401,6 +426,7 @@ private:
 	float currentZHop;							// The amount of Z hop that is currently applied
 
 	// The following contain the details of moves that the Move module fetches
+	// CAUTION: segmentsLeft should ONLY be changed from 0 to not 0 by calling NewMoveAvailable()!
 	RawMove moveBuffer;							// Move details to pass to Move class
 	unsigned int segmentsLeft;					// The number of segments left to do in the current move, or 0 if no move available
 	unsigned int totalSegments;					// The total number of segments left in the complete move
@@ -415,8 +441,16 @@ private:
 	float arcCurrentAngle;
 	float arcAngleIncrement;
 	bool doingArcMove;
-	bool abortedArcMove;
 
+	enum class SegmentedMoveState : uint8_t
+	{
+		inactive = 0,
+		active,
+		aborted
+	};
+	SegmentedMoveState segMoveState;
+
+	AxesBitmap axesHomedBeforeSimulation;		// axes that were homed when we started the simulation
 	RestorePoint simulationRestorePoint;		// The position and feed rate when we started a simulation
 
 	RestorePoint numberedRestorePoints[NumRestorePoints];				// Restore points accessible using the R parameter in the G0/G1 command
@@ -486,6 +520,7 @@ private:
 	float simulationTime;						// Accumulated simulation time
 	uint8_t simulationMode;						// 0 = not simulating, 1 = simulating, >1 are simulation modes for debugging
 	bool exitSimulationWhenFileComplete;		// true if simulating a file
+	bool updateFileWhenSimulationComplete;		// true if simulated time should be appended to the file
 
 	// Firmware retraction settings
 	float retractLength, retractExtra;			// retraction length and extra length to un-retract
@@ -517,9 +552,7 @@ private:
 	FilamentSensorStatus lastFilamentError;
 	size_t lastFilamentErrorExtruder;
 
-	// CNC and laser
-	float spindleRpm;
-	float spindleMaxRpm;
+	// Laser
 	float laserMaxPower;
 
 	// Heater fault handler
@@ -528,13 +561,13 @@ private:
 	uint32_t heaterFaultTimeout;				// how long we wait for the user to fix it before turning everything off
 
 	// Misc
-	uint32_t longWait;							// Timer for things that happen occasionally (seconds)
 	uint32_t lastWarningMillis;					// When we last sent a warning message for things that can happen very often
 	AxesBitmap axesToSenseLength;				// The axes on which we are performing axis length sensing
 	int8_t lastAuxStatusReportType;				// The type of the last status report requested by PanelDue
 	bool isWaiting;								// True if waiting to reach temperature
 	bool cancelWait;							// Set true to cancel waiting
 	bool displayNoToolWarning;					// True if we need to display a 'no tool selected' warning
+	bool m501SeenInConfigFile;					// true if M501 was executed form config.g
 	char filamentToLoad[FilamentNameLength];	// Name of the filament being loaded
 
 	// Standard macro filenames
@@ -560,6 +593,25 @@ private:
 	static constexpr const float MinServoPulseWidth = 544.0, MaxServoPulseWidth = 2400.0;
 	static constexpr uint16_t ServoRefreshFrequency = 50;
 };
+
+// Flag that a new move is available for consumption by the Move subsystem
+// Code that sets up a new move should ensure that segmentsLeft is zero, then set up all the move parameters,
+// then call this function to update SegmentsLeft safely in a multi-threaded environment
+inline void GCodes::NewMoveAvailable(unsigned int sl)
+{
+	totalSegments = sl;
+	__DMB();					// make sure that all the move details have been written first
+	segmentsLeft = sl;			// set the number of segments to indicate that a move is available to be taken
+}
+
+// Flag that a new move is available for consumption by the Move subsystem
+// This version is for when totalSegments has already be set up.
+inline void GCodes::NewMoveAvailable()
+{
+	const unsigned int sl = totalSegments;
+	__DMB();					// make sure that the move details have been written first
+	segmentsLeft = sl;			// set the number of segments to indicate that a move is available to be taken
+}
 
 //*****************************************************************************************************
 

@@ -5,3 +5,8 @@
 !Release/*/*/*.bin
 *~
 *orig
+/Duet2_RTOS/
+
+/Duet2/
+/Duet085/
+/Duet2_RTOS/

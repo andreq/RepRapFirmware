@@ -13,6 +13,7 @@
 #include "Movement/Move.h"
 #include "RepRap.h"
 #include "Tools/Tool.h"
+#include "PrintMonitor.h"
 
 #if HAS_WIFI_NETWORKING
 # include "FirmwareUpdater.h"
@@ -172,8 +173,9 @@ GCodeResult GCodes::SetPositions(GCodeBuffer& gb)
 // Offset the axes by the X, Y, and Z amounts in the M226 code in gb. The actual movement occurs on the next move command.
 // It's not clear from the description in the reprap.org wiki whether offsets are cumulative or not. We now assume they are not.
 // Note that M206 offsets are actually negative offsets.
-GCodeResult GCodes::OffsetAxes(GCodeBuffer& gb)
+GCodeResult GCodes::OffsetAxes(GCodeBuffer& gb, const StringRef& reply)
 {
+	bool seen = false;
 	for (size_t axis = 0; axis < numVisibleAxes; axis++)
 	{
 		if (gb.Seen(axisLetters[axis]))
@@ -184,6 +186,22 @@ GCodeResult GCodes::OffsetAxes(GCodeBuffer& gb)
 			axisOffsets[axis]
 #endif
 						 = -(gb.GetFValue() * distanceScale);
+			seen = true;
+		}
+	}
+
+	if (!seen)
+	{
+		reply.printf("Axis offsets:");
+		for (size_t axis = 0; axis < numVisibleAxes; axis++)
+		{
+			reply.catf(" %c%.2f", axisLetters[axis],
+#if SUPPORT_WORKPLACE_COORDINATES
+				-(double)(workplaceCoordinates[0][axis]/distanceScale)
+#else
+				-(double)(axisOffsets[axis]/distanceScale)
+#endif
+													 );
 		}
 	}
 
@@ -229,7 +247,7 @@ GCodeResult GCodes::GetSetWorkplaceCoordinates(GCodeBuffer& gb, const StringRef&
 				reply.printf("Origin of workplace %" PRIu32 ":", cs);
 				for (size_t axis = 0; axis < numVisibleAxes; axis++)
 				{
-					reply.catf(" %c%.2f", axisLetters[axis], (double)workplaceCoordinates[cs - 1][axis]);
+					reply.catf(" %c%.2f", axisLetters[axis], (double)(workplaceCoordinates[cs - 1][axis]/distanceScale));
 				}
 			}
 			return GCodeResult::ok;
@@ -333,6 +351,71 @@ GCodeResult GCodes::DefineGrid(GCodeBuffer& gb, const StringRef &reply)
 	reply.copy("bad grid definition: ");
 	defaultGrid.PrintError(xRange, yRange, reply);
 	return GCodeResult::error;
+}
+
+// Handle M37 to simulate a whole file
+GCodeResult GCodes::SimulateFile(GCodeBuffer& gb, const StringRef &reply, const StringRef& file, bool updateFile)
+{
+	if (reprap.GetPrintMonitor().IsPrinting())
+	{
+		reply.copy("cannot simulate while a file is being printed");
+		return GCodeResult::error;
+	}
+
+	if (QueueFileToPrint(file.c_str(), reply))
+	{
+		if (simulationMode == 0)
+		{
+			axesHomedBeforeSimulation = axesHomed;
+			axesHomed = LowestNBits<AxesBitmap>(numVisibleAxes);	// pretend all axes are homed
+			reprap.GetMove().GetCurrentUserPosition(simulationRestorePoint.moveCoords, 0, reprap.GetCurrentXAxes(), reprap.GetCurrentYAxes());
+			simulationRestorePoint.feedRate = gb.MachineState().feedRate;
+		}
+		simulationTime = 0.0;
+		exitSimulationWhenFileComplete = true;
+		updateFileWhenSimulationComplete = updateFile;
+		simulationMode = 1;
+		reprap.GetMove().Simulate(simulationMode);
+		reprap.GetPrintMonitor().StartingPrint(file.c_str());
+		StartPrinting(true);
+		reply.printf("Simulating print of file %s", file.c_str());
+		return GCodeResult::ok;
+	}
+
+	return GCodeResult::error;
+}
+
+// handle M37 to change the simulation mode
+GCodeResult GCodes::ChangeSimulationMode(GCodeBuffer& gb, const StringRef &reply, uint32_t newSimulationMode)
+{
+	if (newSimulationMode != simulationMode)
+	{
+		if (!LockMovementAndWaitForStandstill(gb))
+		{
+			return GCodeResult::notFinished;
+		}
+
+		if (newSimulationMode == 0)
+		{
+			EndSimulation(&gb);
+		}
+		else
+		{
+			if (simulationMode == 0)
+			{
+				// Starting a new simulation, so save the current position
+				axesHomedBeforeSimulation = axesHomed;
+				axesHomed = LowestNBits<AxesBitmap>(numVisibleAxes);	// pretend all axes are homed
+				reprap.GetMove().GetCurrentUserPosition(simulationRestorePoint.moveCoords, 0, reprap.GetCurrentXAxes(), reprap.GetCurrentYAxes());
+				simulationRestorePoint.feedRate = gb.MachineState().feedRate;
+			}
+			simulationTime = 0.0;
+		}
+		exitSimulationWhenFileComplete = updateFileWhenSimulationComplete = false;
+		simulationMode = (uint8_t)newSimulationMode;
+		reprap.GetMove().Simulate(simulationMode);
+	}
+	return GCodeResult::ok;
 }
 
 // Handle M558
@@ -674,8 +757,8 @@ GCodeResult GCodes::ProbeTool(GCodeBuffer& gb, const StringRef& reply)
 		if (gb.Seen(axisLetters[axis]))
 		{
 			// Get parameters first and check them
-			const int endStopToUse = gb.Seen('E') ? gb.GetIValue() : 0;
-			if (endStopToUse < 0 || endStopToUse > (int)DRIVES)
+			const int endStopToUse = gb.Seen('E') ? gb.GetIValue() : -1;
+			if (endStopToUse > (int)DRIVES)
 			{
 				reply.copy("Invalid endstop number");
 				return GCodeResult::error;
@@ -687,7 +770,7 @@ GCodeResult GCodes::ProbeTool(GCodeBuffer& gb, const StringRef& reply)
 
 			// Prepare another move similar to G1 .. S3
 			moveBuffer.moveType = 3;
-			if (endStopToUse == 0)
+			if (endStopToUse < 0)
 			{
 				moveBuffer.endStopsToCheck = 0;
 				SetBit(moveBuffer.endStopsToCheck, axis);
@@ -702,7 +785,6 @@ GCodeResult GCodes::ProbeTool(GCodeBuffer& gb, const StringRef& reply)
 			moveBuffer.usePressureAdvance = false;
 			moveBuffer.filePos = noFilePosition;
 			moveBuffer.canPauseAfter = false;
-			moveBuffer.canPauseBefore = true;
 
 			// Decide which way and how far to go
 			if (gb.Seen('R'))
@@ -727,12 +809,12 @@ GCodeResult GCodes::ProbeTool(GCodeBuffer& gb, const StringRef& reply)
 			if (gb.Seen(feedrateLetter))
 			{
 				const float rate = gb.GetFValue() * distanceScale;
-				gb.MachineState().feedrate = rate * SecondsToMinutes;	// don't apply the speed factor to homing and other special moves
+				gb.MachineState().feedRate = rate * SecondsToMinutes;	// don't apply the speed factor to homing and other special moves
 			}
-			moveBuffer.feedRate = gb.MachineState().feedrate;
+			moveBuffer.feedRate = gb.MachineState().feedRate;
 
 			// Kick off new movement
-			segmentsLeft = 1;
+			NewMoveAvailable(1);
 			gb.SetState(GCodeState::probingToolOffset);
 		}
 	}
@@ -755,7 +837,7 @@ GCodeResult GCodes::SetDateTime(GCodeBuffer& gb, const StringRef& reply)
 		// Set date
 		String<12> dateString;
 		gb.GetPossiblyQuotedString(dateString.GetRef());
-		if (strptime(dateString.Pointer(), "%Y-%m-%d", &timeInfo) == nullptr)
+		if (strptime(dateString.c_str(), "%Y-%m-%d", &timeInfo) == nullptr)
 		{
 			reply.copy("Invalid date format");
 			return GCodeResult::error;
@@ -769,7 +851,7 @@ GCodeResult GCodes::SetDateTime(GCodeBuffer& gb, const StringRef& reply)
 		// Set time
 		String<12> timeString;
 		gb.GetPossiblyQuotedString(timeString.GetRef());
-		if (strptime(timeString.Pointer(), "%H:%M:%S", &timeInfo) == nullptr)
+		if (strptime(timeString.c_str(), "%H:%M:%S", &timeInfo) == nullptr)
 		{
 			reply.copy("Invalid time format");
 			return GCodeResult::error;

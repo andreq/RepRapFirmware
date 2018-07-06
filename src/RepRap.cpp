@@ -9,6 +9,7 @@
 #include "PrintMonitor.h"
 #include "Tools/Tool.h"
 #include "Tools/Filament.h"
+#include "Tasks.h"
 #include "Version.h"
 
 #ifdef DUET_NG
@@ -25,10 +26,68 @@
 
 #if HAS_HIGH_SPEED_SD
 # include "sam/drivers/hsmci/hsmci.h"
+# include "conf_sd_mmc.h"
 #endif
 
+#ifdef RTOS
+# include "FreeRTOS.h"
+# include "task.h"
+
+// We call vTaskNotifyGiveFromISR from various interrupts, so the following must be true
+static_assert(configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY <= NvicPriorityHSMCI, "configMAX_SYSCALL_INTERRUPT_PRIORITY is set too high");
+
+static TaskHandle_t hsmciTask = nullptr;		// the task that is waiting for a HSMCI command to complete
+
 // Callback function from the hsmci driver, called while it is waiting for an SD card operation to complete
-extern "C" void hsmciIdle()
+// 'stBits' is the set of bits in the HSMCI status register that the caller is interested in.
+// The caller keeps calling this function until at least one of those bits is set.
+extern "C" void hsmciIdle(uint32_t stBits, uint32_t dmaBits)
+{
+	if (   (HSMCI->HSMCI_SR & stBits) == 0
+#if SAME70
+		&& (XDMAC->XDMAC_CHID[CONF_HSMCI_XDMAC_CHANNEL].XDMAC_CIS & dmaBits) == 0
+#endif
+	   )
+	{
+		// Suspend this task until we get an interrupt indicating that a status bit that we are interested in has been set
+		hsmciTask = xTaskGetCurrentTaskHandle();
+		HSMCI->HSMCI_IER = stBits;
+#if SAME70
+		XDMAC->XDMAC_CHID[CONF_HSMCI_XDMAC_CHANNEL].XDMAC_CIE = dmaBits;
+#endif
+		if (ulTaskNotifyTake(pdTRUE, 200) == 0)
+		{
+			// We timed out waiting for the HSMCI operation to complete
+			reprap.GetPlatform().LogError(ErrorCode::HsmciTimeout);
+		}
+	}
+}
+
+extern "C" void HSMCI_Handler()
+{
+	HSMCI->HSMCI_IDR = 0xFFFFFFFF;					// disable all HSMCI interrupts
+#if SAME70
+	XDMAC->XDMAC_CHID[CONF_HSMCI_XDMAC_CHANNEL].XDMAC_CID = 0xFFFFFFFF;
+#endif
+	if (hsmciTask != nullptr)
+	{
+		vTaskNotifyGiveFromISR(hsmciTask, nullptr);	// wake up the task
+		hsmciTask = nullptr;
+	}
+}
+
+#if SAME70
+extern "C" void XDMAC_handler() __attribute__ ((alias("HSMCI_Handler")));
+#endif
+
+#else
+
+// Non-RTOS code
+
+// Callback function from the hsmci driver, called while it is waiting for an SD card operation to complete
+// 'stBits' is the set of bits in the HSMCI status register that the caller is interested in.
+// The caller keeps calling this function until at least one of those bits is set.
+extern "C" void hsmciIdle(uint32_t stBits, uint32_t dmaBits)
 {
 	if (reprap.GetSpinningModule() != moduleNetwork)
 	{
@@ -53,14 +112,9 @@ extern "C" void hsmciIdle()
 	{
 		FilamentMonitor::Spin(false);
 	}
-
-#if SUPPORT_12864_LCD
-	if (reprap.GetSpinningModule() != moduleDisplay)
-	{
-		reprap.GetDisplay().Spin(false);
-	}
-#endif
 }
+
+#endif
 
 // RepRap member functions.
 
@@ -69,7 +123,8 @@ extern "C" void hsmciIdle()
 RepRap::RepRap() : toolList(nullptr), currentTool(nullptr), lastWarningMillis(0), activeExtruders(0),
 	activeToolHeaters(0), ticksInSpinState(0), spinningModule(noModule), debug(0), stopped(false),
 	active(false), resetting(false), processingConfig(true), beepFrequency(0), beepDuration(0),
-	displayMessageBox(false), boxSeq(0)
+	displayMessageBox(false), boxSeq(0),
+	diagnosticsDestination(MessageType::NoDestinationMessage)
 {
 	OutputBuffer::Init();
 	platform = new Platform();
@@ -99,10 +154,12 @@ RepRap::RepRap() : toolList(nullptr), currentTool(nullptr), lastWarningMillis(0)
 
 void RepRap::Init()
 {
-	// All of the following init functions must execute reasonably quickly before the watchdog times us out
+	toolListMutex.Create("ToolList");
+	messageBoxMutex.Create("MessageBox");
+
 	platform->Init();
 	network->Init();
-	SetName(DEFAULT_MACHINE_NAME);		// network must be initialised before calling this because this calls SetHostName
+	SetName(DEFAULT_MACHINE_NAME);		// Network must be initialised before calling this because this calls SetHostName
 	gCodes->Init();
 	move->Init();
 	heat->Init();
@@ -116,10 +173,11 @@ void RepRap::Init()
 	portControl->Init();
 #endif
 	printMonitor->Init();
+	FilamentMonitor::InitStatic();
 #if SUPPORT_12864_LCD
- 	display->Init();
+	display->Init();
 #endif
-	active = true;						// must do this before we start the network, else the watchdog may time out
+	active = true;						// must do this before we start the network or call Spin(), else the watchdog may time out
 
 	platform->MessageF(UsbMessage, "%s Version %s dated %s\n", FIRMWARE_NAME, VERSION, DATE);
 
@@ -138,11 +196,11 @@ void RepRap::Init()
 
 	if (gCodes->RunConfigFile(configFile))
 	{
-		while (gCodes->IsDaemonBusy())
+		do
 		{
 			// GCodes::Spin will read the macro and ensure IsDaemonBusy returns false when it's done
 			Spin();
-		}
+		} while (gCodes->IsDaemonBusy());
 		platform->Message(UsbMessage, "Done!\n");
 	}
 	else
@@ -152,15 +210,27 @@ void RepRap::Init()
 	processingConfig = false;
 
 	// Enable network (unless it's disabled)
-	network->Activate();			// Need to do this here, as the configuration GCodes may set IP address etc.
+	network->Activate();			// need to do this here, as the configuration GCodes may set IP address etc.
 
 #if HAS_HIGH_SPEED_SD
 	hsmci_set_idle_func(hsmciIdle);
+# ifdef RTOS
+	HSMCI->HSMCI_IDR = 0xFFFFFFFF;	// disable all HSMCI interrupts
+	NVIC_EnableIRQ(HSMCI_IRQn);
+#  if SAME70
+	XDMAC->XDMAC_CHID[CONF_HSMCI_XDMAC_CHANNEL].XDMAC_CID = 0xFFFFFFFF;	// disable all XDMAC interrupts from the HSMCI channel
+	NVIC_EnableIRQ(XDMAC_IRQn);
+#  endif
+# endif
 #endif
 	platform->MessageF(UsbMessage, "%s is up and running.\n", FIRMWARE_NAME);
+
+#if SUPPORT_12864_LCD
+	display->Start();
+#endif
+
 	fastLoop = UINT32_MAX;
 	slowLoop = 0;
-	lastTime = micros();
 }
 
 void RepRap::Exit()
@@ -187,16 +257,22 @@ void RepRap::Exit()
 
 void RepRap::Spin()
 {
-	if(!active)
+	if (!active)
+	{
 		return;
+	}
+
+	const uint32_t lastTime = Platform::GetInterruptClocks();
 
 	ticksInSpinState = 0;
 	spinningModule = modulePlatform;
 	platform->Spin();
 
+#ifndef RTOS
 	ticksInSpinState = 0;
 	spinningModule = moduleNetwork;
 	network->Spin(true);
+#endif
 
 	ticksInSpinState = 0;
 	spinningModule = moduleWebserver;
@@ -209,9 +285,11 @@ void RepRap::Spin()
 	spinningModule = moduleMove;
 	move->Spin();
 
+#ifndef RTOS
 	ticksInSpinState = 0;
 	spinningModule = moduleHeat;
 	heat->Spin();
+#endif
 
 #if SUPPORT_ROLAND
 	ticksInSpinState = 0;
@@ -219,7 +297,7 @@ void RepRap::Spin()
 	roland->Spin();
 #endif
 
-#if SUPPORT_SCANNER
+#if SUPPORT_SCANNER && !SCANNER_AS_SEPARATE_TASK
 	ticksInSpinState = 0;
 	spinningModule = moduleScanner;
 	scanner->Spin();
@@ -254,10 +332,18 @@ void RepRap::Spin()
 	ticksInSpinState = 0;
 	spinningModule = noModule;
 
+	// Check if we need to send diagnostics
+	if (diagnosticsDestination != MessageType::NoDestinationMessage)
+	{
+		Diagnostics(diagnosticsDestination);
+		diagnosticsDestination = MessageType::NoDestinationMessage;
+	}
+
 	// Check if we need to display a cold extrusion warning
 	const uint32_t now = millis();
 	if (now - lastWarningMillis >= MinimumWarningInterval)
 	{
+		MutexLocker lock(toolListMutex);
 		for (Tool *t = toolList; t != nullptr; t = t->Next())
 		{
 			if (t->DisplayColdExtrudeWarning())
@@ -269,8 +355,7 @@ void RepRap::Spin()
 	}
 
 	// Keep track of the loop time
-	const uint32_t t = micros();
-	const uint32_t dt = t - lastTime;
+	const uint32_t dt = Platform::GetInterruptClocks() - lastTime;
 	if (dt < fastLoop)
 	{
 		fastLoop = dt;
@@ -279,12 +364,13 @@ void RepRap::Spin()
 	{
 		slowLoop = dt;
 	}
-	lastTime = t;
+
+	RTOSIface::Yield();
 }
 
 void RepRap::Timing(MessageType mtype)
 {
-	platform->MessageF(mtype, "Slowest main loop (seconds): %f; fastest: %f\n", (double)(slowLoop * 0.000001), (double)(fastLoop * 0.000001));
+	platform->MessageF(mtype, "Slowest loop: %.2fms; fastest: %.2fms\n", (double)(slowLoop * StepClocksToMillis), (double)(fastLoop * StepClocksToMillis));
 	fastLoop = UINT32_MAX;
 	slowLoop = 0;
 }
@@ -292,7 +378,26 @@ void RepRap::Timing(MessageType mtype)
 void RepRap::Diagnostics(MessageType mtype)
 {
 	platform->Message(mtype, "=== Diagnostics ===\n");
+
+	// Print the firmware version and board type
+
+#ifdef DUET_NG
+	platform->MessageF(mtype, "%s version %s running on %s", FIRMWARE_NAME, VERSION, platform->GetElectronicsString());
+	const char* const expansionName = DuetExpansion::GetExpansionBoardName();
+	platform->MessageF(mtype, (expansionName == nullptr) ? "\n" : " + %s\n", expansionName);
+#else
+	platform->MessageF(mtype, "%s version %s running on %s\n", FIRMWARE_NAME, VERSION, platform->GetElectronicsString());
+#endif
+
+#if SAM4E || SAM4S || SAME70
+	platform->PrintUniqueId(mtype);
+#endif
+
+	// Show the used and free buffer counts. Do this early in case we are running out of them and the diagnostics get truncated.
 	OutputBuffer::Diagnostics(mtype);
+
+	// Now print diagnostics for other modules
+	Tasks::Diagnostics(mtype);
 	platform->Diagnostics(mtype);				// this includes a call to our Timing() function
 	move->Diagnostics(mtype);
 	heat->Diagnostics(mtype);
@@ -309,21 +414,36 @@ void RepRap::EmergencyStop()
 {
 	stopped = true;
 
-	// Do not turn off ATX power here. If the nozzles are still hot, don't risk melting any surrounding parts...
+	// Do not turn off ATX power here. If the nozzles are still hot, don't risk melting any surrounding parts by turning fans off.
 	//platform->SetAtxPower(false);
 
-	Tool* tool = toolList;
-	while (tool != nullptr)
+	switch (gCodes->GetMachineType())
 	{
-		tool->Standby();
-		tool = tool->Next();
+	case MachineType::cnc:
+		for (size_t i = 0; i < MaxSpindles; i++)
+		{
+			platform->AccessSpindle(i).TurnOff();
+		}
+		break;
+
+	case MachineType::laser:
+		platform->SetLaserPwm(0.0);
+		break;
+
+	default:
+		break;
 	}
 
-	heat->Exit();
-	for (size_t heater = 0; heater < Heaters; heater++)
+	// Deselect all tools (is this necessary?)
 	{
-		platform->SetHeater(heater, 0.0);
+		MutexLocker lock(toolListMutex);
+		for (Tool* tool = toolList; tool != nullptr; tool = tool->Next())
+		{
+			tool->Standby();
+		}
 	}
+
+	heat->Exit();		// this also turns off all heaters
 
 	// We do this twice, to avoid an interrupt switching a drive back on. move->Exit() should prevent interrupts doing this.
 	for (int i = 0; i < 2; i++)
@@ -383,6 +503,7 @@ void RepRap::PrintDebug()
 // The tool list is maintained in tool number order.
 void RepRap::AddTool(Tool* tool)
 {
+	MutexLocker lock(toolListMutex);
 	Tool** t = &toolList;
 	while(*t != nullptr && (*t)->Number() < tool->Number())
 	{
@@ -415,6 +536,7 @@ void RepRap::DeleteTool(Tool* tool)
 	}
 
 	// Purge any references to this tool
+	MutexLocker lock(toolListMutex);
 	for (Tool **t = &toolList; *t != nullptr; t = &((*t)->next))
 	{
 		if (*t == tool)
@@ -489,6 +611,7 @@ void RepRap::StandbyTool(int toolNumber, bool simulating)
 
 Tool* RepRap::GetTool(int toolNumber) const
 {
+	MutexLocker lock(toolListMutex);
 	Tool* tool = toolList;
 	while(tool != nullptr)
 	{
@@ -515,21 +638,9 @@ Tool* RepRap::GetCurrentOrDefaultTool() const
 	return (currentTool != nullptr) ? currentTool : toolList;
 }
 
-void RepRap::SetToolVariables(int toolNumber, const float* standbyTemperatures, const float* activeTemperatures)
-{
-	Tool* tool = GetTool(toolNumber);
-	if (tool != nullptr)
-	{
-		tool->SetVariables(standbyTemperatures, activeTemperatures);
-	}
-	else
-	{
-		platform->MessageF(ErrorMessage, "Attempt to set variables for a non-existent tool: %d.\n", toolNumber);
-	}
-}
-
 bool RepRap::IsHeaterAssignedToTool(int8_t heater) const
 {
+	MutexLocker lock(toolListMutex);
 	for (Tool *tool = toolList; tool != nullptr; tool = tool->Next())
 	{
 		for (size_t i = 0; i < tool->HeaterCount(); i++)
@@ -576,7 +687,14 @@ void RepRap::Tick()
 
 			// We now save the stack when we get stuck in a spin loop
 			register const uint32_t * stackPtr asm ("sp");
-			platform->SoftwareReset((uint16_t)SoftwareResetReason::stuckInSpin, stackPtr + 5);
+
+			platform->SoftwareReset((uint16_t)SoftwareResetReason::stuckInSpin,
+#ifdef RTOS
+				stackPtr + 5 + 15			// discard the stack used by the FreeRTOS stack handler and our tick handler
+#else
+				stackPtr + 5				// discard the stack used by our tick handler
+#endif
+				);
 		}
 	}
 }
@@ -597,7 +715,6 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 	OutputBuffer *response;
 	if (!OutputBuffer::Allocate(response))
 	{
-		// Should never happen
 		return nullptr;
 	}
 
@@ -628,7 +745,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 	for (size_t axis = 0; axis < numVisibleAxes; axis++)
 	{
 		const float coord = userPos[axis];
-		response->catf("%c%.3f", ch, (double)((std::isnan(coord) || std::isinf(coord)) ? 9999.9 : coord));
+		response->catf("%c%.3f", ch, HideNan(coord));
 		ch = ',';
 	}
 
@@ -651,7 +768,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 		ch = '[';
 		for (size_t drive = 0; drive < numVisibleAxes; drive++)
 		{
-			response->catf("%c%.3f", ch, (double)liveCoordinates[drive]);
+			response->catf("%c%.3f", ch, HideNan(liveCoordinates[drive]));
 			ch = ',';
 		}
 
@@ -678,6 +795,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 		const bool sendMessage = (message[0] != 0);
 
 		float timeLeft = 0.0;
+		MutexLocker lock(messageBoxMutex);
 		if (displayMessageBox && boxTimer != 0)
 		{
 			timeLeft = (float)(boxTimeout) / 1000.0 - (float)(millis() - boxTimer) / 1000.0;
@@ -715,9 +833,9 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 			if (displayMessageBox)
 			{
 				response->cat("\"msgBox\":{\"msg\":");
-				response->EncodeString(boxMessage.c_str(), boxMessage.MaxLength(), false);
+				response->EncodeString(boxMessage.c_str(), boxMessage.Capacity(), false);
 				response->cat(",\"title\":");
-				response->EncodeString(boxTitle.c_str(), boxTitle.MaxLength(), false);
+				response->EncodeString(boxTitle.c_str(), boxTitle.Capacity(), false);
 				response->catf(",\"mode\":%d,\"seq\":%" PRIu32 ",\"timeout\":%.1f,\"controls\":%" PRIu32 "}", boxMode, boxSeq, (double)timeLeft, boxControls);
 			}
 			response->cat("}");
@@ -734,20 +852,20 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 		ch = '[';
 		for(size_t i = 0; i < NUM_FANS; i++)
 		{
-			response->catf("%c%.2f", ch, (double)(platform->GetFanValue(i) * 100.0));
+			response->catf("%c%d", ch, (int)lrintf(platform->GetFanValue(i) * 100.0));
 			ch = ',';
 		}
 
 		// Speed and Extrusion factors
-		response->catf("],\"speedFactor\":%.2f,\"extrFactors\":", (double)(gCodes->GetSpeedFactor() * 100.0));
+		response->catf("],\"speedFactor\":%.1f,\"extrFactors\":", (double)(gCodes->GetSpeedFactor() * 100.0));
 		ch = '[';
 		for (size_t extruder = 0; extruder < GetExtrudersInUse(); extruder++)
 		{
-			response->catf("%c%.2f", ch, (double)(gCodes->GetExtrusionFactor(extruder) * 100.0));
+			response->catf("%c%.1f", ch, (double)(gCodes->GetExtrusionFactor(extruder) * 100.0));
 			ch = ',';
 		}
 		response->cat((ch == '[') ? "[]" : "]");
-		response->catf(",\"babystep\":%.03f}", (double)gCodes->GetBabyStepOffset());
+		response->catf(",\"babystep\":%.3f}", (double)gCodes->GetBabyStepOffset());
 	}
 
 	// G-code reply sequence for webserver (sequence number for AUX is handled later)
@@ -877,36 +995,39 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 
 		/* Tool temperatures */
 		response->cat("},\"tools\":{\"active\":[");
-		for (const Tool *tool = toolList; tool != nullptr; tool = tool->Next())
 		{
-			ch = '[';
-			for (size_t heater = 0; heater < tool->heaterCount; heater++)
+			MutexLocker lock(toolListMutex);
+			for (const Tool *tool = toolList; tool != nullptr; tool = tool->Next())
 			{
-				response->catf("%c%.1f", ch, (double)tool->activeTemperatures[heater]);
-				ch = ',';
-			}
-			response->cat((ch == '[') ? "[]" : "]");
+				ch = '[';
+				for (size_t heater = 0; heater < tool->heaterCount; heater++)
+				{
+					response->catf("%c%.1f", ch, (double)tool->activeTemperatures[heater]);
+					ch = ',';
+				}
+				response->cat((ch == '[') ? "[]" : "]");
 
-			if (tool->Next() != nullptr)
-			{
-				response->cat(",");
+				if (tool->Next() != nullptr)
+				{
+					response->cat(",");
+				}
 			}
-		}
 
-		response->cat("],\"standby\":[");
-		for (const Tool *tool = toolList; tool != nullptr; tool = tool->Next())
-		{
-			ch = '[';
-			for (size_t heater = 0; heater < tool->heaterCount; heater++)
+			response->cat("],\"standby\":[");
+			for (const Tool *tool = toolList; tool != nullptr; tool = tool->Next())
 			{
-				response->catf("%c%.1f", ch, (double)tool->standbyTemperatures[heater]);
-				ch = ',';
-			}
-			response->cat((ch == '[') ? "[]" : "]");
+				ch = '[';
+				for (size_t heater = 0; heater < tool->heaterCount; heater++)
+				{
+					response->catf("%c%.1f", ch, (double)tool->standbyTemperatures[heater]);
+					ch = ',';
+				}
+				response->cat((ch == '[') ? "[]" : "]");
 
-			if (tool->Next() != nullptr)
-			{
-				response->cat(",");
+				if (tool->Next() != nullptr)
+				{
+					response->cat(",");
+				}
 			}
 		}
 
@@ -946,19 +1067,63 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 	}
 #endif
 
-	// Spindle
-	const double spindleRpm = gCodes->GetSpindleRpm();
-	response->catf(",\"spindle\":{\"current\":%1.f,\"active\":%1.f}", spindleRpm, spindleRpm);
+	// Spindles
+	if (gCodes->GetMachineType() == MachineType::cnc)
+	{
+		int lastConfiguredSpindle = -1;
+		for (size_t spindle = 0; spindle < MaxSpindles; spindle++)
+		{
+			if (platform->AccessSpindle(spindle).GetToolNumber() != -1)
+			{
+				lastConfiguredSpindle = spindle;
+			}
+		}
+
+		if (lastConfiguredSpindle != -1)
+		{
+			response->cat(",\"spindles\":[");
+			for (int i = 0; i <= lastConfiguredSpindle; i++)
+			{
+				if (i > 0)
+				{
+					response->cat(',');
+				}
+
+				const Spindle& spindle = platform->AccessSpindle(i);
+				response->catf("{\"current\":%.1f,\"active\":%.1f", (double)spindle.GetCurrentRpm(), (double)spindle.GetRpm());
+				if (type == 2)
+				{
+					response->catf(",\"tool\":%d}", spindle.GetToolNumber());
+				}
+				else
+				{
+					response->cat('}');
+				}
+			}
+			response->cat(']');
+		}
+	}
 
 	/* Extended Status Response */
 	if (type == 2)
 	{
 		// Cold Extrude/Retract
-		response->catf(",\"coldExtrudeTemp\":%1.f", (double)(heat->ColdExtrude() ? 0.0 : HOT_ENOUGH_TO_EXTRUDE));
-		response->catf(",\"coldRetractTemp\":%1.f", (double)(heat->ColdExtrude() ? 0.0 : HOT_ENOUGH_TO_RETRACT));
+		response->catf(",\"coldExtrudeTemp\":%.1f", (double)(heat->ColdExtrude() ? 0.0 : HOT_ENOUGH_TO_EXTRUDE));
+		response->catf(",\"coldRetractTemp\":%.1f", (double)(heat->ColdExtrude() ? 0.0 : HOT_ENOUGH_TO_RETRACT));
+
+		// Controllable Fans
+		FansBitmap controllableFans = 0;
+		for (size_t fan = 0; fan < NUM_FANS; fan++)
+		{
+			if (platform->IsFanControllable(fan))
+			{
+				SetBit(controllableFans, fan);
+			}
+		}
+		response->catf(",\"controllableFans\":%lu", controllableFans);
 
 		// Maximum hotend temperature - DWC just wants the highest one
-		response->catf(",\"tempLimit\":%1.f", (double)(heat->GetHighestTemperatureLimit()));
+		response->catf(",\"tempLimit\":%.1f", (double)(heat->GetHighestTemperatureLimit()));
 
 		// Endstops
 		uint32_t endstops = 0;
@@ -997,7 +1162,7 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 
 		// Machine name
 		response->cat(",\"name\":");
-		response->EncodeString(myName.c_str(), myName.MaxLength(), false);
+		response->EncodeString(myName.c_str(), myName.Capacity(), false);
 
 		/* Probe */
 		{
@@ -1016,12 +1181,19 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 		/* Tool Mapping */
 		{
 			response->cat(",\"tools\":[");
+			MutexLocker lock(toolListMutex);
 			for (Tool *tool = toolList; tool != nullptr; tool = tool->Next())
 			{
-				// Number and Name
+				// Number
+				response->catf("{\"number\":%d", tool->Number());
+
+				// Name
 				const char *toolName = tool->GetName();
-				response->catf("{\"number\":%d,\"name\":", tool->Number());
-				response->EncodeString(toolName, strlen(toolName), false);
+				if (toolName[0] != 0)
+				{
+					response->cat(",\"name\":");
+					response->EncodeString(toolName, strlen(toolName), false);
+				}
 
 				// Heaters
 				response->cat(",\"heaters\":[");
@@ -1089,8 +1261,15 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 				if (tool->GetFilament() != nullptr)
 				{
 					const char *filamentName = tool->GetFilament()->GetName();
-					response->catf(",\"filament\":");
-					response->EncodeString(filamentName, strlen(filamentName), false);
+#if 0	// DC this change broke filament loading/unloading in DWC
+					if (filamentName[0] != 0)
+					{
+#endif
+						response->catf(",\"filament\":");
+						response->EncodeString(filamentName, strlen(filamentName), false);
+#if 0	// DC see above
+					}
+#endif
 				}
 
 				// Offsets
@@ -1147,6 +1326,9 @@ OutputBuffer *RepRap::GetStatusResponse(uint8_t type, ResponseSource source)
 
 		// Fraction of file printed
 		response->catf("],\"fractionPrinted\":%.1f", (double)((printMonitor->IsPrinting()) ? (gCodes->FractionOfFilePrinted() * 100.0) : 0.0));
+
+		// Byte position of the file being printed
+		response->catf(",\"filePosition\":%lu", gCodes->GetFilePosition());
 
 		// First Layer Duration
 		response->catf(",\"firstLayerDuration\":%.1f", (double)(printMonitor->GetFirstLayerDuration()));
@@ -1423,7 +1605,7 @@ OutputBuffer *RepRap::GetLegacyStatusResponse(uint8_t type, int seq)
 	ch = '[';
 	for (size_t i = 0; i < NUM_FANS; ++i)
 	{
-		response->catf("%c%.02f", ch, (double)(platform->GetFanValue(i) * 100.0));
+		response->catf("%c%.1f", ch, (double)(platform->GetFanValue(i) * 100.0));
 		ch = ',';
 	}
 
@@ -1450,25 +1632,29 @@ OutputBuffer *RepRap::GetLegacyStatusResponse(uint8_t type, int seq)
 	// We no longer send the amount of http buffer space here because the web interface doesn't use these forms of status response
 
 	// Deal with the message box, if there is one
-	float timeLeft = 0.0;
-	if (displayMessageBox && boxTimer != 0)
 	{
-		timeLeft = (float)(boxTimeout) / 1000.0 - (float)(millis() - boxTimer) / 1000.0;
-		displayMessageBox = (timeLeft > 0.0);
-	}
+		float timeLeft = 0.0;
+		MutexLocker lock(messageBoxMutex);
 
-	if (displayMessageBox)
-	{
-		response->catf(",\"msgBox.mode\":%d,\"msgBox.seq\":%" PRIu32 ",\"msgBox.timeout\":%.1f,\"msgBox.controls\":%" PRIu32 "",
-						boxMode, boxSeq, (double)timeLeft, boxControls);
-		response->cat(",\"msgBox.msg\":");
-		response->EncodeString(boxMessage.c_str(), boxMessage.MaxLength(), false);
-		response->cat(",\"msgBox.title\":");
-		response->EncodeString(boxTitle.c_str(), boxTitle.MaxLength(), false);
-	}
-	else
-	{
-		response->cat(",\"msgBox.mode\":-1");					// tell PanelDue that there is no active message box
+		if (displayMessageBox && boxTimer != 0)
+		{
+			timeLeft = (float)(boxTimeout) / 1000.0 - (float)(millis() - boxTimer) / 1000.0;
+			displayMessageBox = (timeLeft > 0.0);
+		}
+
+		if (displayMessageBox)
+		{
+			response->catf(",\"msgBox.mode\":%d,\"msgBox.seq\":%" PRIu32 ",\"msgBox.timeout\":%.1f,\"msgBox.controls\":%" PRIu32 "",
+							boxMode, boxSeq, (double)timeLeft, boxControls);
+			response->cat(",\"msgBox.msg\":");
+			response->EncodeString(boxMessage.c_str(), boxMessage.Capacity(), false);
+			response->cat(",\"msgBox.title\":");
+			response->EncodeString(boxTitle.c_str(), boxTitle.Capacity(), false);
+		}
+		else
+		{
+			response->cat(",\"msgBox.mode\":-1");					// tell PanelDue that there is no active message box
+		}
 	}
 
 	if (type == 2)
@@ -1487,7 +1673,7 @@ OutputBuffer *RepRap::GetLegacyStatusResponse(uint8_t type, int seq)
 		// Add the static fields
 		response->catf(",\"geometry\":\"%s\",\"axes\":%u,\"axisNames\":\"%s\",\"volumes\":%u,\"numTools\":%u,\"myName\":",
 						move->GetGeometryString(), numVisibleAxes, gCodes->GetAxisLetters(), NumSdCards, GetNumberOfContiguousTools());
-		response->EncodeString(myName.c_str(), myName.MaxLength(), false);
+		response->EncodeString(myName.c_str(), myName.Capacity(), false);
 		response->cat(",\"firmwareName\":");
 		response->EncodeString(FIRMWARE_NAME, strlen(FIRMWARE_NAME), false);
 	}
@@ -1509,7 +1695,7 @@ OutputBuffer *RepRap::GetLegacyStatusResponse(uint8_t type, int seq)
 
 // Get the list of files in the specified directory in JSON format.
 // If flagDirs is true then we prefix each directory with a * character.
-OutputBuffer *RepRap::GetFilesResponse(const char *dir, bool flagsDirs)
+OutputBuffer *RepRap::GetFilesResponse(const char *dir, unsigned int startAt, bool flagsDirs)
 {
 	// Need something to write to...
 	OutputBuffer *response;
@@ -1520,65 +1706,69 @@ OutputBuffer *RepRap::GetFilesResponse(const char *dir, bool flagsDirs)
 
 	response->copy("{\"dir\":");
 	response->EncodeString(dir, strlen(dir), false);
-	response->cat(",\"files\":[");
+	response->catf(",\"first\":%u,\"files\":[", startAt);
 	unsigned int err;
+	unsigned int nextFile = 0;
 
 	if (!platform->GetMassStorage()->CheckDriveMounted(dir))
 	{
 		err = 1;
 	}
+	else if (!platform->GetMassStorage()->DirectoryExists(dir))
+	{
+		err = 2;
+	}
 	else
 	{
 		err = 0;
 		FileInfo fileInfo;
-		bool firstFile = true;
+		unsigned int filesFound = 0;
 		bool gotFile = platform->GetMassStorage()->FindFirst(dir, fileInfo);	// TODO error handling here
 
 		size_t bytesLeft = OutputBuffer::GetBytesLeft(response);	// don't write more bytes than we can
-		char filename[MaxFilenameLength];
-		filename[0] = '*';
-		const char *fname;
 
 		while (gotFile)
 		{
 			if (fileInfo.fileName[0] != '.')						// ignore Mac resource files and Linux hidden files
 			{
-				// Get the long filename if possible
-				if (flagsDirs && fileInfo.isDirectory)
+				if (filesFound >= startAt)
 				{
-					SafeStrncpy(filename + 1, fileInfo.fileName, ARRAY_SIZE(fileInfo.fileName) - 1);
-					fname = filename;
-				}
-				else
-				{
-					fname = fileInfo.fileName;
-				}
+					// Make sure we can end this response properly
+					if (bytesLeft < strlen(fileInfo.fileName) * 2 + 20)
+					{
+						// No more space available - stop here
+						platform->GetMassStorage()->AbandonFindNext();
+						nextFile = filesFound;
+						break;
+					}
 
-				// Make sure we can end this response properly
-				if (bytesLeft < strlen(fname) * 2 + 4)
-				{
-					// No more space available - stop here
-					break;
-				}
+					// Write separator and filename
+					if (filesFound > startAt)
+					{
+						bytesLeft -= response->cat(',');
+					}
 
-				// Write separator and filename
-				if (!firstFile)
-				{
-					bytesLeft -= response->cat(',');
+					bytesLeft -= response->EncodeString(fileInfo.fileName, MaxFilenameLength, false, true, flagsDirs && fileInfo.isDirectory);
 				}
-				bytesLeft -= response->EncodeString(fname, MaxFilenameLength, false);
-
-				firstFile = false;
+				++filesFound;
 			}
 			gotFile = platform->GetMassStorage()->FindNext(fileInfo);	// TODO error handling here
 		}
 	}
-	response->catf("],\"err\":%u}", err);
+
+	if (err != 0)
+	{
+		response->catf("],\"err\":%u}", err);
+	}
+	else
+	{
+		response->catf("],\"next\":%u,\"err\":%u}", nextFile, err);
+	}
 	return response;
 }
 
 // Get a JSON-style filelist including file types and sizes
-OutputBuffer *RepRap::GetFilelistResponse(const char *dir)
+OutputBuffer *RepRap::GetFilelistResponse(const char *dir, unsigned int startAt)
 {
 	// Need something to write to...
 	OutputBuffer *response;
@@ -1587,70 +1777,170 @@ OutputBuffer *RepRap::GetFilelistResponse(const char *dir)
 		return nullptr;
 	}
 
-	// If the requested volume is not mounted, report an error
-	if (!platform->GetMassStorage()->CheckDriveMounted(dir))
-	{
-		response->copy("{\"err\":1}");
-		return response;
-	}
-
-	// Check if the directory exists
-	if (!platform->GetMassStorage()->DirectoryExists(dir))
-	{
-		response->copy("{\"err\":2}");
-		return response;
-	}
-
 	response->copy("{\"dir\":");
 	response->EncodeString(dir, strlen(dir), false);
-	response->cat(",\"files\":[");
+	response->catf(",\"first\":%u,\"files\":[", startAt);
+	unsigned int err;
+	unsigned int nextFile = 0;
 
-	FileInfo fileInfo;
-	bool firstFile = true;
-	bool gotFile = platform->GetMassStorage()->FindFirst(dir, fileInfo);
-	size_t bytesLeft = OutputBuffer::GetBytesLeft(response);	// don't write more bytes than we can
-
-	while (gotFile)
+	if (!platform->GetMassStorage()->CheckDriveMounted(dir))
 	{
-		if (fileInfo.fileName[0] != '.')			// ignore Mac resource files and Linux hidden files
+		err = 1;
+	}
+	else if (!platform->GetMassStorage()->DirectoryExists(dir))
+	{
+		err = 2;
+	}
+	else
+	{
+		err = 0;
+		FileInfo fileInfo;
+		unsigned int filesFound = 0;
+		bool gotFile = platform->GetMassStorage()->FindFirst(dir, fileInfo);
+		size_t bytesLeft = OutputBuffer::GetBytesLeft(response);	// don't write more bytes than we can
+
+		while (gotFile)
 		{
-			// Make sure we can end this response properly
-			if (bytesLeft < strlen(fileInfo.fileName) + 70)
+			if (fileInfo.fileName[0] != '.')			// ignore Mac resource files and Linux hidden files
 			{
-				// No more space available - stop here
-				break;
+				if (filesFound >= startAt)
+				{
+					// Make sure we can end this response properly
+					if (bytesLeft < strlen(fileInfo.fileName) * 2 + 50)
+					{
+						// No more space available - stop here
+						platform->GetMassStorage()->AbandonFindNext();
+						nextFile = filesFound;
+						break;
+					}
+
+					// Write delimiter
+					if (filesFound != 0)
+					{
+						bytesLeft -= response->cat(',');
+					}
+
+					// Write another file entry
+					bytesLeft -= response->catf("{\"type\":\"%c\",\"name\":", fileInfo.isDirectory ? 'd' : 'f');
+					bytesLeft -= response->EncodeString(fileInfo.fileName, MaxFilenameLength, false);
+					bytesLeft -= response->catf(",\"size\":%" PRIu32, fileInfo.size);
+
+					const struct tm * const timeInfo = gmtime(&fileInfo.lastModified);
+					if (timeInfo->tm_year <= /*19*/80)
+					{
+						// Don't send the last modified date if it is invalid
+						bytesLeft -= response->cat('}');
+					}
+					else
+					{
+						bytesLeft -= response->catf(",\"date\":\"%04u-%02u-%02uT%02u:%02u:%02u\"}",
+								timeInfo->tm_year + 1900, timeInfo->tm_mon + 1, timeInfo->tm_mday,
+								timeInfo->tm_hour, timeInfo->tm_min, timeInfo->tm_sec);
+					}
+				}
+				++filesFound;
+			}
+			gotFile = platform->GetMassStorage()->FindNext(fileInfo);
+		}
+	}
+
+	// If there is no error, don't append "err":0 because if we do then DWC thinks there has been an error - looks like it doesn't check the value
+	if (err != 0)
+	{
+		response->catf("],\"err\":%u}", err);
+	}
+	else
+	{
+		response->catf("],\"next\":%u}", nextFile);
+	}
+
+	return response;
+}
+
+// Get information for the specified file, or the currently printing file, in JSON format
+bool RepRap::GetFileInfoResponse(const char *filename, OutputBuffer *&response, bool quitEarly)
+{
+	// Poll file info for a specific file
+	if (filename != nullptr && filename[0] != 0)
+	{
+		GCodeFileInfo info;
+		if (!platform->GetMassStorage()->GetFileInfo(GCODE_DIR, filename, info, quitEarly))
+		{
+			// This may take a few runs...
+			return false;
+		}
+
+		if (info.isValid)
+		{
+			if (!OutputBuffer::Allocate(response))
+			{
+				// Should never happen
+				return false;
 			}
 
-			// Write delimiter
-			if (!firstFile)
+			response->printf("{\"err\":0,\"size\":%lu,",info.fileSize);
+			const struct tm * const timeInfo = gmtime(&info.lastModifiedTime);
+			if (timeInfo->tm_year > /*19*/80)
 			{
-				bytesLeft -= response->cat(',');
-			}
-			firstFile = false;
-
-			// Write another file entry
-			bytesLeft -= response->catf("{\"type\":\"%c\",\"name\":", fileInfo.isDirectory ? 'd' : 'f');
-			bytesLeft -= response->EncodeString(fileInfo.fileName, MaxFilenameLength, false);
-			bytesLeft -= response->catf(",\"size\":%" PRIu32, fileInfo.size);
-
-			const struct tm * const timeInfo = gmtime(&fileInfo.lastModified);
-			if (timeInfo->tm_year <= /*19*/80)
-			{
-				// Don't send the last modified date if it is invalid
-				bytesLeft -= response->cat('}');
-			}
-			else
-			{
-				bytesLeft -= response->catf(",\"date\":\"%04u-%02u-%02uT%02u:%02u:%02u\"}",
+				response->catf("\"lastModified\":\"%04u-%02u-%02uT%02u:%02u:%02u\",",
 						timeInfo->tm_year + 1900, timeInfo->tm_mon + 1, timeInfo->tm_mday,
 						timeInfo->tm_hour, timeInfo->tm_min, timeInfo->tm_sec);
 			}
-		}
-		gotFile = platform->GetMassStorage()->FindNext(fileInfo);
-	}
-	response->cat("]}");
 
-	return response;
+			response->catf("\"height\":%.2f,\"firstLayerHeight\":%.2f,\"layerHeight\":%.2f,",
+				(double)info.objectHeight, (double)info.firstLayerHeight, (double)info.layerHeight);
+			if (info.printTime != 0)
+			{
+				response->catf("\"printTime\":%" PRIu32 ",", info.printTime);
+			}
+			if (info.simulatedTime != 0)
+			{
+				response->catf("\"simulatedTime\":%" PRIu32 ",", info.simulatedTime);
+			}
+			response->cat("\"filament\":");
+			char ch = '[';
+			if (info.numFilaments == 0)
+			{
+				response->cat(ch);
+			}
+			else
+			{
+				for (size_t i = 0; i < info.numFilaments; ++i)
+				{
+					response->catf("%c%.1f", ch, (double)info.filamentNeeded[i]);
+					ch = ',';
+				}
+			}
+			response->cat("],\"generatedBy\":");
+			response->EncodeString(info.generatedBy.c_str(), info.generatedBy.Capacity(), false);
+			response->cat("}");
+		}
+		else
+		{
+			if (!OutputBuffer::Allocate(response))
+			{
+				// Should never happen
+				return false;
+			}
+
+			response->copy("{\"err\":1}");
+		}
+	}
+	else if (GetPrintMonitor().IsPrinting())
+	{
+		return GetPrintMonitor().GetPrintingFileInfoResponse(response);
+	}
+	else
+	{
+		if (!OutputBuffer::Allocate(response))
+		{
+			// Should never happen
+			return false;
+		}
+
+		response->copy("{\"err\":1}");
+	}
+	return true;
 }
 
 // Send a beep. We send it to both PanelDue and the web interface.
@@ -1693,6 +1983,7 @@ void RepRap::SetMessage(const char *msg)
 // Display a message box on the web interface
 void RepRap::SetAlert(const char *msg, const char *title, int mode, float timeout, AxesBitmap controls)
 {
+	MutexLocker lock(messageBoxMutex);
 	boxMessage.copy(msg);
 	boxTitle.copy(title);
 	boxMode = mode;
@@ -1706,6 +1997,7 @@ void RepRap::SetAlert(const char *msg, const char *title, int mode, float timeou
 // Clear pending message box
 void RepRap::ClearAlert()
 {
+	MutexLocker lock(messageBoxMutex);
 	displayMessageBox = false;
 }
 
@@ -1715,6 +2007,9 @@ char RepRap::GetStatusCharacter() const
 	return    (processingConfig)										? 'C'	// Reading the configuration file
 			: (gCodes->IsFlashing())									? 'F'	// Flashing a new firmware binary
 			: (IsStopped()) 											? 'H'	// Halted
+#if HAS_VOLTAGE_MONITOR
+			: (!platform->HasVinPower() && !gCodes->IsSimulating())		? 'O'	// Off i.e. powered down
+#endif
 			: (gCodes->IsPausing()) 									? 'D'	// Pausing / Decelerating
 			: (gCodes->IsResuming()) 									? 'R'	// Resuming
 			: (gCodes->IsDoingToolChange())								? 'T'	// Changing tool
@@ -1801,6 +2096,7 @@ unsigned int RepRap::GetProhibitedExtruderMovements(unsigned int extrusions, uns
 
 void RepRap::FlagTemperatureFault(int8_t dudHeater)
 {
+	MutexLocker lock(toolListMutex);
 	if (toolList != nullptr)
 	{
 		toolList->FlagTemperatureFault(dudHeater);
@@ -1810,6 +2106,7 @@ void RepRap::FlagTemperatureFault(int8_t dudHeater)
 void RepRap::ClearTemperatureFault(int8_t wasDudHeater)
 {
 	heat->ResetFault(wasDudHeater);
+	MutexLocker lock(toolListMutex);
 	if (toolList != nullptr)
 	{
 		toolList->ClearTemperatureFault(wasDudHeater);
@@ -1834,6 +2131,7 @@ bool RepRap::WriteToolSettings(FileStore *f) const
 {
 	// First write the settings of all tools except the current one and the command to select them if they are on standby
 	bool ok = true;
+	MutexLocker lock(toolListMutex);
 	for (const Tool *t = toolList; t != nullptr && ok; t = t->Next())
 	{
 		if (t != currentTool)
@@ -1854,16 +2152,14 @@ bool RepRap::WriteToolSettings(FileStore *f) const
 bool RepRap::WriteToolParameters(FileStore *f) const
 {
 	bool ok = true, written = false;
+	MutexLocker lock(toolListMutex);
 	for (const Tool *t = toolList; ok && t != nullptr; t = t->Next())
 	{
 		const AxesBitmap axesProbed = t->GetAxisOffsetsProbed();
 		if (axesProbed != 0)
 		{
-			if (written)
-			{
-				scratchString.Clear();
-			}
-			else
+			String<ScratchStringLength> scratchString;
+			if (!written)
 			{
 				scratchString.copy("; Probed tool offsets\n");
 				written = true;
@@ -1877,7 +2173,7 @@ bool RepRap::WriteToolParameters(FileStore *f) const
 				}
 			}
 			scratchString.cat('\n');
-			ok = f->Write(scratchString.Pointer());
+			ok = f->Write(scratchString.c_str());
 		}
 	}
 	return ok;

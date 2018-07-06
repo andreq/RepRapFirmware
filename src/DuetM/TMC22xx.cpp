@@ -44,13 +44,13 @@ constexpr uint32_t GCONF_INT_RSENSE = 1 << 1;				// use internal sense resistors
 constexpr uint32_t GCONF_SPREAD_CYCLE = 1 << 2;				// use spread cycle mode (else stealthchop mode)
 constexpr uint32_t GCONF_REV_DIR = 1 << 3;					// reverse motor direction
 constexpr uint32_t GCONF_INDEX_OTPW = 1 << 4;				// INDEX output shows over temperature warning (else it shows first microstep position)
-constexpr uint32_t GCONF_INDEX_PULSE = 1 << 5;				// INDEX output shows pulses form internal pulse generator, else as set by GCONF_INDEX_OTPW
+constexpr uint32_t GCONF_INDEX_PULSE = 1 << 5;				// INDEX output shows pulses from internal pulse generator, else as set by GCONF_INDEX_OTPW
 constexpr uint32_t GCONF_UART = 1 << 6;						// PDN_UART used for UART interface (else used for power down)
 constexpr uint32_t GCONF_MSTEP_REG = 1 << 7;				// microstep resolution set by MSTEP register (else by MS1 and MS2 pins)
 constexpr uint32_t GCONF_MULTISTEP_FILT = 1 << 8;			// pulse generation optimised for >750Hz full stepping frequency
 constexpr uint32_t GCONF_TEST_MODE = 1 << 9;				// test mode, do not set this bit for normal operation
 
-constexpr uint32_t DefaultGConfReg = GCONF_UART | GCONF_MSTEP_REG | GCONF_MULTISTEP_FILT | GCONF_SPREAD_CYCLE;	// TODO - do we want spread cycle or not?
+constexpr uint32_t DefaultGConfReg = GCONF_UART | GCONF_MSTEP_REG | GCONF_MULTISTEP_FILT;
 
 // General configuration and status registers
 
@@ -256,8 +256,13 @@ public:
 	void Init(uint32_t p_driverNumber, Pin p_pin);
 	void SetAxisNumber(size_t p_axisNumber);
 	void WriteAll();
-	void SetChopConf(uint32_t newVal);
-	void SetMicrostepping(uint32_t shift, bool interpolate);
+	bool SetChopConf(uint32_t newVal);
+	uint32_t GetChopConf() const;
+	void SetCoolStep(uint16_t coolStepConfig);
+	bool SetMicrostepping(uint32_t shift, bool interpolate);
+	unsigned int GetMicrostepping(bool& interpolation) const;		// Get microstepping
+	bool SetDriverMode(unsigned int mode);
+	DriverMode GetDriverMode() const;
 	void SetCurrent(float current);
 	void Enable(bool en);
 	void AppendDriverStatus(const StringRef& reply);
@@ -272,7 +277,6 @@ public:
 	void TransferTimedOut() { ++numTimeouts; }
 	static void AbortTransfer();
 
-	unsigned int GetMicrostepping(int mode, bool& interpolation) const;		// get microstepping or chopper control register
 	uint32_t ReadLiveStatus() const;
 	uint32_t ReadAccumulatedStatus(uint32_t bitsToKeep);
 
@@ -476,15 +480,8 @@ void TmcDriverState::SetStandstillCurrentPercent(float percent)
 	UpdateCurrent();
 }
 
-// Set the chopper control register to the settings provided by the user
-void TmcDriverState::SetChopConf(uint32_t newVal)
-{
-	configuredChopConfReg = (newVal & (CHOPCONF_TBL_MASK | CHOPCONF_HSTRT_MASK | CHOPCONF_HEND_MASK | CHOPCONF_TOFF_MASK)) | CHOPCONF_VSENSE_HIGH;
-	UpdateChopConfRegister();
-}
-
 // Set the microstepping and microstep interpolation. The desired microstepping is (1 << shift).
-void TmcDriverState::SetMicrostepping(uint32_t shift, bool interpolate)
+bool TmcDriverState::SetMicrostepping(uint32_t shift, bool interpolate)
 {
 	microstepShiftFactor = shift;
 	configuredChopConfReg = (configuredChopConfReg & ~(CHOPCONF_MRES_MASK | CHOPCONF_INTPOL)) | ((8 - shift) << CHOPCONF_MRES_SHIFT);
@@ -493,6 +490,52 @@ void TmcDriverState::SetMicrostepping(uint32_t shift, bool interpolate)
 		configuredChopConfReg |= CHOPCONF_INTPOL;
 	}
 	UpdateChopConfRegister();
+	return true;
+}
+
+// Get microstepping or chopper control register
+unsigned int TmcDriverState::GetMicrostepping(bool& interpolation) const
+{
+	interpolation = (writeRegisters[WriteChopConf] & CHOPCONF_INTPOL) != 0;
+	return 1u << microstepShiftFactor;
+}
+
+// Set the chopper control register to the settings provided by the user
+bool TmcDriverState::SetChopConf(uint32_t newVal)
+{
+	configuredChopConfReg = (newVal & (CHOPCONF_TBL_MASK | CHOPCONF_HSTRT_MASK | CHOPCONF_HEND_MASK | CHOPCONF_TOFF_MASK)) | CHOPCONF_VSENSE_HIGH;
+	UpdateChopConfRegister();
+	return true;
+}
+
+// Get microstepping or chopper control register
+uint32_t TmcDriverState::GetChopConf() const
+{
+	return configuredChopConfReg;
+}
+
+// Set the driver mode
+bool TmcDriverState::SetDriverMode(unsigned int mode)
+{
+	switch (mode)
+	{
+	case (unsigned int)DriverMode::spreadCycle:
+		UpdateRegister(WriteGConf, writeRegisters[WriteGConf] | GCONF_SPREAD_CYCLE);
+		return true;
+
+	case (unsigned int)DriverMode::stealthChop:
+		UpdateRegister(WriteGConf, writeRegisters[WriteGConf] & ~GCONF_SPREAD_CYCLE);
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+// Get the driver mode
+DriverMode TmcDriverState::GetDriverMode() const
+{
+	return ((writeRegisters[WriteGConf] & GCONF_SPREAD_CYCLE) != 0) ? DriverMode::spreadCycle : DriverMode::stealthChop;
 }
 
 // Set the motor current
@@ -517,12 +560,15 @@ void TmcDriverState::UpdateCurrent()
 // Enable or disable the driver
 void TmcDriverState::Enable(bool en)
 {
-	enabled = en;
-	if (enablePin != NoPin)
+	if (enabled != en)
 	{
-		digitalWrite(enablePin, !en);				// we assume that smart drivers always have active low enables
+		enabled = en;
+		if (enablePin != NoPin)
+		{
+			digitalWrite(enablePin, !en);			// we assume that smart drivers always have active low enables
+		}
+		UpdateChopConfRegister();
 	}
-	UpdateChopConfRegister();
 }
 
 // Read the status
@@ -574,22 +620,8 @@ void TmcDriverState::AppendDriverStatus(const StringRef& reply)
 		reply.cat(" ok");
 	}
 
-	reply.catf(", read errors %u, write errors %u, ifcount %u, reads %u, timoeuts %u", readErrors, writeErrors, lastIfCount, numReads, numTimeouts);
+	reply.catf(", read errors %u, write errors %u, ifcount %u, reads %u, timeouts %u", readErrors, writeErrors, lastIfCount, numReads, numTimeouts);
 	readErrors = writeErrors = numReads = numTimeouts = 0;
-}
-
-// Get microstepping or chopper control register
-unsigned int TmcDriverState::GetMicrostepping(int mode, bool& interpolation) const
-{
-	interpolation = (writeRegisters[WriteChopConf] & CHOPCONF_INTPOL) != 0;
-	if (mode == ChopperControlRegisterMode)
-	{
-		return configuredChopConfReg;
-	}
-	else
-	{
-		return 1u << microstepShiftFactor;
-	}
 }
 
 // This is called by the ISR when the SPI transfer has completed
@@ -815,39 +847,51 @@ namespace SmartDrivers
 	}
 
 	// Set microstepping or chopper control register
-	bool SetMicrostepping(size_t drive, unsigned int microsteps, int mode)
+	bool SetMicrostepping(size_t drive, unsigned int microsteps, bool interpolate)
 	{
-		if (drive < numTmc22xxDrivers)
+		if (drive < numTmc22xxDrivers && microsteps > 0)
 		{
-			if (mode == ChopperControlRegisterMode && microsteps >= 0)
+			// Set the microstepping. We need to determine how many bits right to shift the desired microstepping to reach 1.
+			unsigned int shift = 0;
+			unsigned int uSteps = (unsigned int)microsteps;
+			while ((uSteps & 1) == 0)
 			{
-				driverStates[drive].SetChopConf((uint32_t)microsteps);	// set the chopper control register
-				return true;
+				uSteps >>= 1;
+				++shift;
 			}
-			else if (microsteps > 0 && (mode == 0 || mode == 1))
+			if (uSteps == 1 && shift <= 8)
 			{
-				// Set the microstepping. We need to determine how many bits right to shift the desired microstepping to reach 1.
-				unsigned int shift = 0;
-				unsigned int uSteps = (unsigned int)microsteps;
-				while ((uSteps & 1) == 0)
-				{
-					uSteps >>= 1;
-					++shift;
-				}
-				if (uSteps == 1 && shift <= 8)
-				{
-					driverStates[drive].SetMicrostepping(shift, mode != 0);
-					return true;
-				}
+				driverStates[drive].SetMicrostepping(shift, interpolate);
+				return true;
 			}
 		}
 		return false;
 	}
 
 	// Get microstepping or chopper control register
-	unsigned int GetMicrostepping(size_t drive, int mode, bool& interpolation)
+	unsigned int GetMicrostepping(size_t drive, bool& interpolation)
 	{
-		return (drive < numTmc22xxDrivers) ? driverStates[drive].GetMicrostepping(mode, interpolation) : 1;
+		return (drive < numTmc22xxDrivers) ? driverStates[drive].GetMicrostepping(interpolation) : 1;
+	}
+
+	bool SetDriverMode(size_t driver, unsigned int mode)
+	{
+		return driver < numTmc22xxDrivers && driverStates[driver].SetDriverMode(mode);
+	}
+
+	DriverMode GetDriverMode(size_t driver)
+	{
+		return (driver < numTmc22xxDrivers) ? driverStates[driver].GetDriverMode() : DriverMode::unknown;
+	}
+
+	bool SetChopperControlRegister(size_t driver, uint32_t ccr)
+	{
+		return driver < numTmc22xxDrivers && driverStates[driver].SetChopConf(ccr);
+	}
+
+	uint32_t GetChopperControlRegister(size_t driver)
+	{
+		return (driver < numTmc22xxDrivers) ? driverStates[driver].GetChopConf() : 0;
 	}
 
 	// Flag that the the drivers have been powered up or down and handle any timeouts
@@ -958,7 +1002,3 @@ namespace SmartDrivers
 };	// end namespace
 
 // End
-
-
-
-

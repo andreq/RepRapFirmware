@@ -127,14 +127,12 @@ void Webserver::Spin()
 		// Check if we can actually send something back to the client
 		if (OutputBuffer::GetBytesLeft(nullptr) == 0)
 		{
-			platform->ClassReport(longWait);
 			return;
 		}
 
 		// We must ensure that we have exclusive access to LWIP
 		if (!network->Lock())
 		{
-			platform->ClassReport(longWait);
 			return;
 		}
 
@@ -238,7 +236,6 @@ void Webserver::Spin()
 		}
 		network->Unlock();		// unlock LWIP again
 	}
-	platform->ClassReport(longWait);
 }
 
 void Webserver::Exit()
@@ -524,7 +521,8 @@ void Webserver::HttpInterpreter::Spin()
 	{
 		while (!gcodeReply->IsEmpty())
 		{
-			OutputBuffer::ReleaseAll(gcodeReply->Pop());
+			OutputBuffer *buf = gcodeReply->Pop();
+			OutputBuffer::ReleaseAll(buf);
 		}
 		clientsServed = 0;
 	}
@@ -794,11 +792,9 @@ void Webserver::HttpInterpreter::SendJsonResponse(const char* command)
 
 		if (StringEquals(command, "configfile"))	// rr_configfile [DEPRECATED]
 		{
-			const char *configPath = platform->GetMassStorage()->CombineName(platform->GetSysDir(), platform->GetConfigFile());
-			char fileName[MaxFilenameLength];
-			SafeStrncpy(fileName, configPath, MaxFilenameLength);
-
-			SendFile(fileName, false);
+			String<MaxFilenameLength> fileName;
+			MassStorage::CombineName(fileName.GetRef(), platform->GetSysDir(), platform->GetConfigFile());
+			SendFile(fileName.c_str(), false);
 			return;
 		}
 
@@ -909,7 +905,7 @@ void Webserver::HttpInterpreter::GetJsonResponse(const char* request, OutputBuff
 	}
 	else if (!IsAuthenticated())
 	{
-		RejectMessage("Not authorized", 500);
+		RejectMessage("Not authorized", 401);
 	}
 	else if (StringEquals(request, "disconnect"))
 	{
@@ -939,7 +935,7 @@ void Webserver::HttpInterpreter::GetJsonResponse(const char* request, OutputBuff
 	}
 	else if (StringEquals(request, "gcode") && GetKeyValue("gcode") != nullptr)
 	{
-		RegularGCodeInput * const httpInput = reprap.GetGCodes().GetHTTPInput();
+		NetworkGCodeInput * const httpInput = reprap.GetGCodes().GetHTTPInput();
 		httpInput->Put(HttpMessage, GetKeyValue("gcode"));
 		response->printf("{\"buff\":%u}", httpInput->BufferSpaceLeft());
 	}
@@ -955,19 +951,23 @@ void Webserver::HttpInterpreter::GetJsonResponse(const char* request, OutputBuff
 	else if (StringEquals(request, "filelist") && GetKeyValue("dir") != nullptr)
 	{
 		OutputBuffer::Release(response);
-		response = reprap.GetFilelistResponse(GetKeyValue("dir"));
+		const char* const firstVal = GetKeyValue("first");
+		const unsigned int startAt = (firstVal == nullptr) ? 0 : (unsigned int)SafeStrtol(firstVal);
+		response = reprap.GetFilelistResponse(GetKeyValue("dir"), startAt);		// this may return nullptr
 	}
 	else if (StringEquals(request, "files"))
 	{
+		OutputBuffer::Release(response);
 		const char* dir = GetKeyValue("dir");
 		if (dir == nullptr)
 		{
 			dir = platform->GetGCodeDir();
 		}
+		const char* const firstVal = GetKeyValue("first");
+		const unsigned int startAt = (firstVal == nullptr) ? 0 : SafeStrtol(firstVal);
 		const char* const flagDirsVal = GetKeyValue("flagDirs");
 		const bool flagDirs = flagDirsVal != nullptr && atoi(flagDirsVal) == 1;
-		OutputBuffer::Release(response);
-		response = reprap.GetFilesResponse(dir, flagDirs);
+		response = reprap.GetFilesResponse(dir, startAt, flagDirs);				// this may return nullptr
 	}
 	else if (StringEquals(request, "fileinfo"))
 	{
@@ -1110,7 +1110,8 @@ bool Webserver::HttpInterpreter::CanParseData()
 		if (OutputBuffer::Truncate(gcodeReply->GetFirstItem(), minHttpResponseSize) == 0)
 		{
 			// Truncating didn't work out, but see if we can free up a few more bytes by releasing the first reply item
-			OutputBuffer::ReleaseAll(gcodeReply->Pop());
+			OutputBuffer *buf = gcodeReply->Pop();
+			OutputBuffer::ReleaseAll(buf);
 		}
 	}
 
@@ -1721,7 +1722,7 @@ void Webserver::HttpInterpreter::ProcessDeferredRequest()
 	// At the moment only file info requests are deferred.
 	// Parsing the file may take a while, so keep LwIP running while we're waiting
 	network->Unlock();
-	bool gotFileInfo = reprap.GetPrintMonitor().GetFileInfoResponse(filenameBeingProcessed, jsonResponse);
+	bool gotFileInfo = reprap.GetFileInfoResponse(filenameBeingProcessed, jsonResponse, false);
 	while (!network->Lock());
 
 	// Because LwIP was unlocked before, there is a chance that the ConnectionLost() call has already
@@ -1993,7 +1994,7 @@ void Webserver::FtpInterpreter::ProcessLine()
 			else if (StringStartsWith(clientMessage, "CWD"))
 			{
 				ReadFilename(3);
-				ChangeDirectory(filename);
+				ChangeDirectory(filename.c_str());
 			}
 			// change to parent of current directory
 			else if (StringEquals(clientMessage, "CDUP"))
@@ -2048,7 +2049,7 @@ void Webserver::FtpInterpreter::ProcessLine()
 			else if (StringStartsWith(clientMessage, "DELE"))
 			{
 				ReadFilename(4);
-				if (platform->GetMassStorage()->Delete(currentDir, filename))
+				if (platform->GetMassStorage()->Delete(currentDir, filename.c_str()))
 				{
 					SendReply(250, "Delete operation successful.");
 				}
@@ -2061,7 +2062,7 @@ void Webserver::FtpInterpreter::ProcessLine()
 			else if (StringStartsWith(clientMessage, "RMD"))
 			{
 				ReadFilename(3);
-				if (platform->GetMassStorage()->Delete(currentDir, filename))
+				if (platform->GetMassStorage()->Delete(currentDir, filename.c_str()))
 				{
 					SendReply(250, "Remove directory operation successful.");
 				}
@@ -2074,11 +2075,17 @@ void Webserver::FtpInterpreter::ProcessLine()
 			else if (StringStartsWith(clientMessage, "MKD"))
 			{
 				ReadFilename(3);
-				const char *location = (filename[0] == '/')
-										? filename
-											: platform->GetMassStorage()->CombineName(currentDir, filename);
+				String<MaxFilenameLength> location;
+				if (filename[0] == '/')
+				{
+					location.copy(filename.c_str());
+				}
+				else
+				{
+					MassStorage::CombineName(location.GetRef(), currentDir, filename.c_str());
+				}
 
-				if (platform->GetMassStorage()->MakeDirectory(location))
+				if (platform->GetMassStorage()->MakeDirectory(location.c_str()))
 				{
 					NetworkTransaction *transaction = webserver->currentTransaction;
 					transaction->Printf("257 \"%s\" created\r\n", location);
@@ -2095,12 +2102,12 @@ void Webserver::FtpInterpreter::ProcessLine()
 				ReadFilename(4);
 				if (filename[0] != '/')
 				{
-					const char *temp = platform->GetMassStorage()->CombineName(currentDir, filename);
-					SafeStrncpy(filename, temp, MaxFilenameLength);
-					filename[MaxFilenameLength - 1] = 0;
+					String<MaxFilenameLength> temp;
+					MassStorage::CombineName(temp.GetRef(), currentDir, filename.c_str());
+					filename.copy(temp.c_str());
 				}
 
-				if (platform->GetMassStorage()->FileExists(filename))
+				if (platform->GetMassStorage()->FileExists(filename.c_str()))
 				{
 					SendReply(350, "Ready to RNTO.");
 				}
@@ -2112,13 +2119,13 @@ void Webserver::FtpInterpreter::ProcessLine()
 			else if (StringStartsWith(clientMessage, "RNTO"))
 			{
 				// Copy origin path to temp oldFilename and read new path
-				char oldFilename[MaxFilenameLength];
-				SafeStrncpy(oldFilename, filename, MaxFilenameLength);
-				oldFilename[MaxFilenameLength - 1] = 0;
+				String<MaxFilenameLength> oldFilename;
+				oldFilename.copy(filename.c_str());
 				ReadFilename(4);
 
-				const char *newFilename = platform->GetMassStorage()->CombineName(currentDir, filename);
-				if (platform->GetMassStorage()->Rename(oldFilename, newFilename))
+				String<MaxFilenameLength> newFilename;
+				MassStorage::CombineName(newFilename.GetRef(), currentDir, filename.c_str());
+				if (platform->GetMassStorage()->Rename(oldFilename.c_str(), newFilename.c_str()))
 				{
 					SendReply(250, "Rename successful.");
 				}
@@ -2223,8 +2230,8 @@ void Webserver::FtpInterpreter::ProcessLine()
 			{
 				ReadFilename(4);
 
-				FileStore *file = platform->OpenFile(currentDir, filename, OpenMode::write);
-				if (StartUpload(file, filename))
+				FileStore *file = platform->OpenFile(currentDir, filename.c_str(), OpenMode::write);
+				if (StartUpload(file, filename.c_str()))
 				{
 					SendReply(150, "OK to send data.");
 					state = doingPasvIO;
@@ -2241,7 +2248,7 @@ void Webserver::FtpInterpreter::ProcessLine()
 			{
 				ReadFilename(4);
 
-				FileStore *file = platform->OpenFile(currentDir, filename, OpenMode::read);
+				FileStore *file = platform->OpenFile(currentDir, filename.c_str(), OpenMode::read);
 				if (file == nullptr)
 				{
 					SendReply(550, "Failed to open file.");
@@ -2642,7 +2649,7 @@ bool Webserver::TelnetInterpreter::ProcessLine()
 			}
 
 			// All other codes are stored for the GCodes class
-			RegularGCodeInput * const telnetInput = reprap.GetGCodes().GetTelnetInput();
+			NetworkGCodeInput * const telnetInput = reprap.GetGCodes().GetTelnetInput();
 			telnetInput->Put(TelnetMessage, clientMessage);
 			break;
 	}

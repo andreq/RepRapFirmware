@@ -32,7 +32,7 @@ constexpr size_t NumFirmwareUpdateModules = 1;		// 1 module
 #define SUPPORT_ROLAND		0						// set nonzero to support Roland mill
 #define SUPPORT_SCANNER		0						// set zero to disable support for FreeLSS scanners
 #define SUPPORT_IOBITS		0						// set to support P parameter in G0/G1 commands
-#define SUPPORT_DHT_SENSOR	0						// set nonzero to support DHT temperature/humidity sensors
+#define SUPPORT_DHT_SENSOR	1						// set nonzero to support DHT temperature/humidity sensors (requires RTOS)
 #define SUPPORT_WORKPLACE_COORDINATES	1			// set nonzero to support G10 L2 and G53..59
 #define SUPPORT_12864_LCD	1						// set nonzero to support 12864 LCD and rotary encoder
 
@@ -67,8 +67,8 @@ constexpr size_t NUM_SERIAL_CHANNELS = 2;			// The number of serial IO channels 
 // Drivers
 constexpr Pin GlobalTmcEnablePin = 1;				// The pin that drives ENN of all drivers
 constexpr Pin ENABLE_PINS[DRIVES] = { NoPin, NoPin, NoPin, NoPin, NoPin, 63, 61 };
-constexpr Pin STEP_PINS[DRIVES] = { 56, 38, 64, 40, 41, 67, 60 };
-constexpr Pin DIRECTION_PINS[DRIVES] = { 54, 8, 30, 33, 42, 18, 57 };
+constexpr Pin STEP_PINS[DRIVES] = { 56, 38, 64, 40, 41, 67, 57 };
+constexpr Pin DIRECTION_PINS[DRIVES] = { 54, 8, 30, 33, 42, 18, 60 };
 constexpr Pin DriverMuxPins[3] = { 50, 52, 53 };	// Pins that control the UART multiplexer, LSB first
 
 // Endstops
@@ -112,6 +112,7 @@ constexpr float PowerMonitorVoltageRange = 11.0 * 3.3;						// We use an 11:1 vo
 
 // Digital pin number to turn the IR LED on (high) or off (low), also controls the DIAG LED
 constexpr Pin Z_PROBE_MOD_PIN = 62;
+constexpr Pin DiagPin = Z_PROBE_MOD_PIN;
 
 // Cooling fans
 constexpr size_t NUM_FANS = 3;

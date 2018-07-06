@@ -165,6 +165,11 @@ Licence: GPL
 #include "Platform.h"
 #include "RepRap.h"
 
+#ifdef RTOS
+# include "FreeRTOS.h"
+# include "task.h"
+#endif
+
 // We just need one instance of RepRap; everything else is contained within it and hidden
 
 RepRap reprap;
@@ -193,9 +198,6 @@ const char * const moduleName[] =
 
 // Utilities and storage not part of any class
 
-static char scratchStringBuffer[220];		// this needs to be long enough to print delta parameters and 24 words of stack (217 bytes)
-StringRef scratchString(scratchStringBuffer, ARRAY_SIZE(scratchStringBuffer));
-
 // For debug use
 void debugPrintf(const char* fmt, ...)
 {
@@ -204,6 +206,15 @@ void debugPrintf(const char* fmt, ...)
 	reprap.GetPlatform().MessageF(DebugMessage, fmt, vargs);
 	va_end(vargs);
 }
+
+#ifdef RTOS
+
+void delay(uint32_t ms)
+{
+	vTaskDelay(ms);
+}
+
+#endif
 
 // String testing
 
@@ -289,6 +300,12 @@ void SafeStrncat(char *dst, const char *src, size_t length)
 	dst[length - 1] = 0;
 }
 
+// Convert a float to double for passing to printf etc. If it is a NaN or infinity, convert it to 9999.9 to avoid getting JSON parse errors.
+double HideNan(float val)
+{
+	return (double)((std::isnan(val) || std::isinf(val)) ? 9999.9 : val);
+}
+
 // Append a list of driver numbers to a string, with a space before each one
 void ListDrivers(const StringRef& str, DriversBitmap drivers)
 {
@@ -296,7 +313,7 @@ void ListDrivers(const StringRef& str, DriversBitmap drivers)
 	{
 		if ((drivers & 1) != 0)
 		{
-			scratchString.catf(" %u", d);
+			str.catf(" %u", d);
 		}
 		drivers >>= 1;
 	}

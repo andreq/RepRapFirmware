@@ -32,6 +32,15 @@
 #include "Libraries/General/IP4String.h"
 #include "Version.h"
 
+#ifdef RTOS
+
+# include "Tasks.h"
+# include "RTOSIface.h"
+
+constexpr size_t NetworkStackWords = 550;
+static Task<NetworkStackWords> networkTask;
+
+#endif
 
 Network::Network(Platform& p) : platform(p), responders(nullptr), nextResponderToPoll(nullptr)
 {
@@ -50,11 +59,17 @@ Network::Network(Platform& p) : platform(p), responders(nullptr), nextResponderT
 // Note that Platform::Init() must be called before this to that Platform::IsDuetWiFi() returns the correct value
 void Network::Init()
 {
+	httpMutex.Create("HTTP");
+	telnetMutex.Create("Telnet");
+
 #if defined(DUET_NG)
 	interfaces[0] = (platform.IsDuetWiFi()) ? static_cast<NetworkInterface*>(new WiFiInterface(platform)) : static_cast<NetworkInterface*>(new W5500Interface(platform));
 #endif
 
 	// Create the responders
+	HttpResponder::InitStatic();
+	TelnetResponder::InitStatic();
+
 	for (size_t i = 0; i < NumTelnetResponders; ++i)
 	{
 		responders = new TelnetResponder(responders);
@@ -77,7 +92,8 @@ void Network::Init()
 		iface->Init();
 	}
 
-	longWait = millis();
+	fastLoop = UINT32_MAX;
+	slowLoop = 0;
 }
 
 GCodeResult Network::EnableProtocol(unsigned int interface, NetworkProtocol protocol, int port, int secure, const StringRef& reply)
@@ -192,6 +208,15 @@ void Network::ResetWiFiForUpload(bool external)
 #endif
 }
 
+extern "C" void NetworkLoop(void *)
+{
+	for (;;)
+	{
+		reprap.GetNetwork().Spin(true);
+		RTOSIface::Yield();
+	}
+}
+
 // This is called at the end of config.g processing.
 // Start the network if it was enabled
 void Network::Activate()
@@ -203,6 +228,11 @@ void Network::Activate()
 			iface->Activate();
 		}
 	}
+
+#ifdef RTOS
+	networkTask.Create(NetworkLoop, "NETWORK", nullptr, TaskBase::SpinPriority);
+#endif
+
 }
 
 void Network::Exit()
@@ -214,6 +244,8 @@ void Network::Exit()
 			iface->Exit();
 		}
 	}
+
+	// TODO: close down the network and suspend the network task. Not trivial because currently, the caller may be the network task.
 }
 
 // Get the network state into the reply buffer, returning true if there is some sort of error
@@ -236,6 +268,8 @@ bool Network::IsWiFiInterface(unsigned int interface) const
 // Main spin loop. If 'full' is true then we are being called from the main spin loop. If false then we are being called during HSMCI idle time.
 void Network::Spin(bool full)
 {
+	const uint32_t lastTime = Platform::GetInterruptClocks();
+
 	// Keep the network modules running
 	for (NetworkInterface *iface : interfaces)
 	{
@@ -257,8 +291,19 @@ void Network::Spin(bool full)
 			nr = nr->GetNext();
 		} while (!doneSomething && nr != nextResponderToPoll);
 		nextResponderToPoll = nr;
+	}
 
-		platform.ClassReport(longWait);
+	HttpResponder::CheckSessions();		// time out any sessions that have gone away
+
+	// Keep track of the loop time
+	const uint32_t dt = Platform::GetInterruptClocks() - lastTime;
+	if (dt < fastLoop)
+	{
+		fastLoop = dt;
+	}
+	if (dt > slowLoop)
+	{
+		slowLoop = dt;
 	}
 }
 
@@ -274,6 +319,11 @@ void Network::Interrupt()
 void Network::Diagnostics(MessageType mtype)
 {
 	platform.Message(mtype, "=== Network ===\n");
+
+	platform.MessageF(mtype, "Slowest loop: %.2fms; fastest: %.2fms\n", (double)(slowLoop * StepClocksToMillis), (double)(fastLoop * StepClocksToMillis));
+	fastLoop = UINT32_MAX;
+	slowLoop = 0;
+
 	platform.Message(mtype, "Responder states:");
 	for (NetworkResponder *r = responders; r != nullptr; r = r->GetNext())
 	{
@@ -386,21 +436,25 @@ bool Network::FindResponder(Socket *skt, NetworkProtocol protocol)
 
 void Network::HandleHttpGCodeReply(const char *msg)
 {
+	MutexLocker lock(httpMutex);
 	HttpResponder::HandleGCodeReply(msg);
 }
 
 void Network::HandleTelnetGCodeReply(const char *msg)
 {
+	MutexLocker lock(telnetMutex);
 	TelnetResponder::HandleGCodeReply(msg);
 }
 
 void Network::HandleHttpGCodeReply(OutputBuffer *buf)
 {
+	MutexLocker lock(httpMutex);
 	HttpResponder::HandleGCodeReply(buf);
 }
 
 void Network::HandleTelnetGCodeReply(OutputBuffer *buf)
 {
+	MutexLocker lock(telnetMutex);
 	TelnetResponder::HandleGCodeReply(buf);
 }
 

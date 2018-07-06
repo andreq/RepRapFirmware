@@ -112,9 +112,6 @@ constexpr Pin SpiTempSensorCsPins[MaxSpiTempSensors] = { 28, 50, 51, 52, 24, 97,
 
 #endif
 
-// DHTxx data pin
-constexpr Pin DhtDataPin = 97;												// Pin CS6
-
 // Pin that controls the ATX power on/off
 constexpr Pin ATX_POWER_PIN = 79;
 
@@ -129,6 +126,7 @@ constexpr Pin VssaSensePin = 103;
 
 // Digital pin number to turn the IR LED on (high) or off (low), also controls the DIAG LED
 constexpr Pin Z_PROBE_MOD_PIN = 34;
+constexpr Pin DiagPin = Z_PROBE_MOD_PIN;
 
 // Cooling fans
 constexpr size_t NUM_FANS = 9;
@@ -164,7 +162,8 @@ constexpr Pin ROLAND_RTS_PIN = xx;											// Expansion pin 12, PA13_RXD1
 // This is the mapping from logical pins 60+ to firmware pin numbers
 constexpr Pin SpecialPinMap[] =
 {
-	24, 97, 98, 99															// We allow CS5-CS8 to be used because few users need >4 thermocouples or RTDs
+	24, 97, 98, 99,															// We allow CS5-CS8 to be used because few users need >4 thermocouples or RTDs
+	7																		// SW_ENC on CONN_SD
 };
 constexpr Pin DueX5GpioPinMap[] = { 211, 210, 209, 208 };					// Pins 100-103 map to GPIO 1-4 on DueX5
 // We also allow pins 120-135 to be used if there is an additional SX1509B expander

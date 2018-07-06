@@ -2,6 +2,15 @@
 #include "Platform.h"
 #include "RepRap.h"
 #include "sd_mmc.h"
+#include "RTOSIface.h"
+
+// A note on using mutexes:
+// Each SD card volume has its own mutex. There is also one for the file table, and one for the find first/find next buffer.
+// The FatFS subsystem locks and releases the appropriate volume mutex when it is called.
+// Any function that needs to acquire both the file table mutex and a volume mutex MUST take the file table mutex first, to avoid deadlocks.
+// Any function that needs to acquire both the find buffer mutex and a volume mutex MUST take the find buffer mutex first, to avoid deadlocks.
+// No function should need to take both the file table mutex and the find buffer mutex.
+// No function in here should be called when the caller already owns the shared SPI mutex.
 
 // Static helper functions - not declared as class members to avoid having to include sd_mmc.h everywhere
 static const char* TranslateCardType(card_type_t ct)
@@ -54,6 +63,13 @@ MassStorage::MassStorage(Platform* p) : freeWriteBuffers(nullptr)
 
 void MassStorage::Init()
 {
+	static const char * const VolMutexNames[] = { "SD0", "SD1" };
+	static_assert(ARRAY_SIZE(VolMutexNames) >= NumSdCards, "Incorrect VolMutexNames array");
+
+	// Create the mutexes
+	fsMutex.Create("FileSystem");
+	dirMutex.Create("DirSearch");
+
 	for (size_t i = 0; i < NumFileWriteBuffers; ++i)
 	{
 		freeWriteBuffers = new FileWriteBuffer(freeWriteBuffers);
@@ -65,7 +81,8 @@ void MassStorage::Init()
 		memset(&inf.fileSystem, 0, sizeof(inf.fileSystem));
 		inf.mounting = inf.isMounted = false;
 		inf.cdPin = SdCardDetectPins[card];
-		inf.cardState = CardDetectState::present;
+		inf.cardState = (inf.cdPin == NoPin) ? CardDetectState::present : CardDetectState::notPresent;
+		inf.volMutex.Create(VolMutexNames[card]);
 	}
 
 	sd_mmc_init(SdWriteProtectPins, SdSpiCSPins);		// initialize SD MMC stack
@@ -81,12 +98,13 @@ void MassStorage::Init()
 	if (reply.strlen() != 0)
 	{
 		delay(3000);		// Wait a few seconds so users have a chance to see this
-		reprap.GetPlatform().MessageF(UsbMessage, "%s\n", reply.Pointer());
+		reprap.GetPlatform().MessageF(UsbMessage, "%s\n", reply.c_str());
 	}
 }
 
 FileWriteBuffer *MassStorage::AllocateWriteBuffer()
 {
+	MutexLocker lock(fsMutex);
 	if (freeWriteBuffers == nullptr)
 	{
 		return nullptr;
@@ -100,24 +118,20 @@ FileWriteBuffer *MassStorage::AllocateWriteBuffer()
 
 void MassStorage::ReleaseWriteBuffer(FileWriteBuffer *buffer)
 {
+	MutexLocker lock(fsMutex);
 	buffer->SetNext(freeWriteBuffers);
 	freeWriteBuffers = buffer;
 }
 
 FileStore* MassStorage::OpenFile(const char* directory, const char* fileName, OpenMode mode)
 {
-	for (size_t i = 0; i < MAX_FILES; i++)
 	{
-		if (!files[i].inUse)
+		MutexLocker lock(fsMutex);
+		for (size_t i = 0; i < MAX_FILES; i++)
 		{
-			if (files[i].Open(directory, fileName, mode))
+			if (files[i].usageMode == FileUseMode::free)
 			{
-				files[i].inUse = true;
-				return &files[i];
-			}
-			else
-			{
-				return nullptr;
+				return (files[i].Open(directory, fileName, mode)) ? &files[i]: nullptr;
 			}
 		}
 	}
@@ -128,17 +142,19 @@ FileStore* MassStorage::OpenFile(const char* directory, const char* fileName, Op
 // Close all files
 void MassStorage::CloseAllFiles()
 {
+	MutexLocker lock(fsMutex);
 	for (FileStore& f : files)
 	{
-		while (f.inUse)
+		while (f.usageMode != FileUseMode::free)
 		{
 			f.Close();
 		}
 	}
 }
 
-const char* MassStorage::CombineName(const char* directory, const char* fileName)
+/*static*/ void MassStorage::CombineName(const StringRef& outbuf, const char* directory, const char* fileName)
 {
+	outbuf.Clear();
 	size_t outIndex = 0;
 	size_t inIndex = 0;
 
@@ -147,19 +163,20 @@ const char* MassStorage::CombineName(const char* directory, const char* fileName
 	{
 		while (directory[inIndex] != 0 && directory[inIndex] != '\n')
 		{
-			combinedName[outIndex] = directory[inIndex];
+			outbuf.Pointer()[outIndex] = directory[inIndex];
 			inIndex++;
 			outIndex++;
-			if (outIndex >= ARRAY_SIZE(combinedName))
+			if (outIndex >= outbuf.Capacity())
 			{
 				reprap.GetPlatform().MessageF(ErrorMessage, "CombineName() buffer overflow");
-				outIndex = 0;
+				outbuf.copy("?????");
+				return;
 			}
 		}
 
-		if (inIndex > 0 && directory[inIndex - 1] != '/' && outIndex < ARRAY_UPB(combinedName))
+		if (inIndex > 0 && directory[inIndex - 1] != '/')
 		{
-			combinedName[outIndex] = '/';
+			outbuf.Pointer()[outIndex] = '/';
 			outIndex++;
 		}
 		inIndex = 0;
@@ -167,35 +184,40 @@ const char* MassStorage::CombineName(const char* directory, const char* fileName
 
 	while (fileName[inIndex] != 0 && fileName[inIndex] != '\n')
 	{
-		combinedName[outIndex] = fileName[inIndex];
-		inIndex++;
-		outIndex++;
-		if (outIndex >= ARRAY_SIZE(combinedName))
+		if (outIndex >= outbuf.Capacity())
 		{
 			reprap.GetPlatform().Message(ErrorMessage, "file name too long");
-			outIndex = 0;
+			outbuf.copy("?????");
+			return;
 		}
+		outbuf.Pointer()[outIndex] = fileName[inIndex];
+		inIndex++;
+		outIndex++;
 	}
-	combinedName[outIndex] = 0;
-
-	return combinedName;
+	outbuf.Pointer()[outIndex] = 0;
 }
 
 // Open a directory to read a file list. Returns true if it contains any files, false otherwise.
+// If this returns true then the file system mutex is owned. The caller must subsequently release the mutex either
+// by calling FindNext until it returns false, or by calling AbandonFindNext.
 bool MassStorage::FindFirst(const char *directory, FileInfo &file_info)
 {
-	TCHAR loc[MaxFilenameLength + 1];
-
-	// Remove the trailing '/' from the directory name
-	SafeStrncpy(loc, directory, ARRAY_SIZE(loc));
-	const size_t len = strlen(loc);
-	if (len != 0 && loc[len - 1] == '/')
+	// Remove any trailing '/' from the directory name, it sometimes (but not always) confuses f_opendir
+	String<MaxFilenameLength> loc;
+	loc.copy(directory);
+	const size_t len = loc.strlen();
+	if (len != 0 && (loc[len - 1] == '/' || loc[len - 1] == '\\'))
 	{
-		loc[len - 1] = 0;
+		loc.Truncate(len - 1);
+	}
+
+	if (!dirMutex.Take(10000))
+	{
+		return false;
 	}
 
 	findDir.lfn = nullptr;
-	FRESULT res = f_opendir(&findDir, loc);
+	FRESULT res = f_opendir(&findDir, loc.c_str());
 	if (res == FR_OK)
 	{
 		FILINFO entry;
@@ -222,12 +244,19 @@ bool MassStorage::FindFirst(const char *directory, FileInfo &file_info)
 		}
 	}
 
+	dirMutex.Release();
 	return false;
 }
 
 // Find the next file in a directory. Returns true if another file has been read.
+// If it returns false then it also releases the mutex.
 bool MassStorage::FindNext(FileInfo &file_info)
 {
+	if (dirMutex.GetHolder() != RTOSIface::GetCurrentTask())
+	{
+		return false;		// error, we don't hold the mutex
+	}
+
 	FILINFO entry;
 	entry.lfname = file_info.fileName;
 	entry.lfsize = ARRAY_SIZE(file_info.fileName);
@@ -236,6 +265,7 @@ bool MassStorage::FindNext(FileInfo &file_info)
 	if (f_readdir(&findDir, &entry) != FR_OK || entry.fname[0] == 0)
 	{
 		//f_closedir(findDir);
+		dirMutex.Release();
 		return false;
 	}
 
@@ -251,6 +281,15 @@ bool MassStorage::FindNext(FileInfo &file_info)
 	return true;
 }
 
+// Quit searching for files. Needed to avoid hanging on to the mutex.
+void MassStorage::AbandonFindNext()
+{
+	if (dirMutex.GetHolder() == RTOSIface::GetCurrentTask())
+	{
+		dirMutex.Release();
+	}
+}
+
 // Month names. The first entry is used for invalid month numbers.
 static const char *monthNames[13] = { "???", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
@@ -263,32 +302,40 @@ const char* MassStorage::GetMonthName(const uint8_t month)
 // Delete a file or directory
 bool MassStorage::Delete(const char* directory, const char* fileName, bool silent)
 {
-	const char* const location = (directory != nullptr)
-									? reprap.GetPlatform().GetMassStorage()->CombineName(directory, fileName)
-									: fileName;
+	String<MaxFilenameLength> location;
+	CombineName(location.GetRef(), directory, fileName);
 
-	// First check whether the file is open - don't allow it to be deleted if it is
-	FIL file;
-	const FRESULT openReturn = f_open(&file, location, FA_OPEN_EXISTING | FA_READ);
-	if (openReturn == FR_OK)
+	FRESULT unlinkReturn;
+
+	// Start new scope to lock the filesystem for the minimum time
 	{
-		for (const FileStore& fil : files)
+		MutexLocker lock(fsMutex);
+
+		// First check whether the file is open - don't allow it to be deleted if it is
+		FIL file;
+		const FRESULT openReturn = f_open(&file, location.c_str(), FA_OPEN_EXISTING | FA_READ);
+		if (openReturn == FR_OK)
 		{
-			if (fil.file.fs == file.fs && fil.file.dir_sect == file.dir_sect && fil.file.dir_ptr == file.dir_ptr )
+			for (const FileStore& fil : files)
 			{
-				reprap.GetPlatform().MessageF(ErrorMessage, "Cannot delete file %s because it is open\n", location);
-				f_close(&file);
-				return false;
+				if (fil.file.fs == file.fs && fil.file.dir_sect == file.dir_sect && fil.file.dir_ptr == file.dir_ptr )
+				{
+					reprap.GetPlatform().MessageF(ErrorMessage, "Cannot delete file %s because it is open\n", location.c_str());
+					f_close(&file);
+					return false;
+				}
 			}
+			f_close(&file);
 		}
-		f_close(&file);
+
+		unlinkReturn = f_unlink(location.c_str());
 	}
 
-	if (f_unlink(location) != FR_OK)
+	if (unlinkReturn != FR_OK)
 	{
 		if (!silent)
 		{
-			reprap.GetPlatform().MessageF(ErrorMessage, "Failed to delete file %s\n", location);
+			reprap.GetPlatform().MessageF(ErrorMessage, "Failed to delete file %s\n", location.c_str());
 		}
 		return false;
 	}
@@ -298,10 +345,11 @@ bool MassStorage::Delete(const char* directory, const char* fileName, bool silen
 // Create a new directory
 bool MassStorage::MakeDirectory(const char *parentDir, const char *dirName)
 {
-	const char* const location = reprap.GetPlatform().GetMassStorage()->CombineName(parentDir, dirName);
-	if (f_mkdir(location) != FR_OK)
+	String<MaxFilenameLength> location;
+	CombineName(location.GetRef(), parentDir, dirName);
+	if (f_mkdir(location.c_str()) != FR_OK)
 	{
-		reprap.GetPlatform().MessageF(ErrorMessage, "Failed to create directory %s\n", location);
+		reprap.GetPlatform().MessageF(ErrorMessage, "Failed to create directory %s\n", location.c_str());
 		return false;
 	}
 	return true;
@@ -345,34 +393,51 @@ bool MassStorage::FileExists(const char *file) const
 
 bool MassStorage::FileExists(const char *directory, const char *fileName) const
 {
-	const char * const location = (directory != nullptr)
-									? reprap.GetPlatform().GetMassStorage()->CombineName(directory, fileName)
-									: fileName;
-	return FileExists(location);
+	String<MaxFilenameLength> location;
+	CombineName(location.GetRef(), directory, fileName);
+	return FileExists(location.c_str());
+}
+
+// Check if the specified directory exists
+// Warning: if 'path' has a trailing '/' or '\\' character, it will be removed!
+bool MassStorage::DirectoryExists(const StringRef& path) const
+{
+	// Remove any trailing '/' from the directory name, it sometimes (but not always) confuses f_opendir
+	const size_t len = path.strlen();
+	if (len != 0 && (path[len - 1] == '/' || path[len - 1] == '\\'))
+	{
+		path[len - 1] = 0;
+	}
+
+	DIR dir;
+	dir.lfn = nullptr;
+	return (f_opendir(&dir, path.c_str()) == FR_OK);
 }
 
 // Check if the specified directory exists
 bool MassStorage::DirectoryExists(const char *path) const
 {
-	DIR dir;
-	dir.lfn = nullptr;
-	return (f_opendir(&dir, path) == FR_OK);
+	// Remove any trailing '/' from the directory name, it sometimes (but not always) confuses f_opendir
+	String<MaxFilenameLength> loc;
+	loc.copy(path);
+	return DirectoryExists(loc.GetRef());
 }
 
 bool MassStorage::DirectoryExists(const char* directory, const char* subDirectory)
 {
-	return DirectoryExists(CombineName(directory, subDirectory));
+	String<MaxFilenameLength> location;
+	CombineName(location.GetRef(), directory, subDirectory);
+	return DirectoryExists(location.GetRef());
 }
 
 // Return the last modified time of a file, or zero if failure
 time_t MassStorage::GetLastModifiedTime(const char* directory, const char *fileName) const
 {
-	const char * const location = (directory != nullptr)
-									? reprap.GetPlatform().GetMassStorage()->CombineName(directory, fileName)
-									: fileName;
+	String<MaxFilenameLength> location;
+	CombineName(location.GetRef(), directory, fileName);
 	FILINFO fil;
 	fil.lfname = nullptr;
-	if (f_stat(location, &fil) == FR_OK)
+	if (f_stat(location.c_str(), &fil) == FR_OK)
 	{
 		return ConvertTimeStamp(fil.fdate, fil.ftime);
 	}
@@ -381,17 +446,16 @@ time_t MassStorage::GetLastModifiedTime(const char* directory, const char *fileN
 
 bool MassStorage::SetLastModifiedTime(const char* directory, const char *fileName, time_t time)
 {
-	const char * const location = (directory != nullptr)
-									? reprap.GetPlatform().GetMassStorage()->CombineName(directory, fileName)
-									: fileName;
+	String<MaxFilenameLength> location;
+	CombineName(location.GetRef(), directory, fileName);
 	const struct tm * const timeInfo = gmtime(&time);
 	FILINFO fno;
     fno.fdate = (WORD)(((timeInfo->tm_year - 80) * 512U) | (timeInfo->tm_mon + 1) * 32U | timeInfo->tm_mday);
     fno.ftime = (WORD)(timeInfo->tm_hour * 2048U | timeInfo->tm_min * 32U | timeInfo->tm_sec / 2U);
-    const bool ok = (f_utime(location, &fno) == FR_OK);
+    const bool ok = (f_utime(location.c_str(), &fno) == FR_OK);
     if (!ok)
 	{
-		reprap.GetPlatform().MessageF(ErrorMessage, "Failed to set last modified time for file '%s'\n", location);
+		reprap.GetPlatform().MessageF(ErrorMessage, "Failed to set last modified time for file '%s'\n", location.c_str());
 	}
     return ok;
 }
@@ -408,6 +472,8 @@ GCodeResult MassStorage::Mount(size_t card, const StringRef& reply, bool reportS
 	}
 
 	SdCardInfo& inf = info[card];
+	MutexLocker lock1(fsMutex);
+	MutexLocker lock2(inf.volMutex);
 	if (!inf.mounting)
 	{
 		if (inf.isMounted)
@@ -504,8 +570,8 @@ GCodeResult MassStorage::Unmount(size_t card, const StringRef& reply)
 // Ideally we would try to mount it if it is not, however mounting a drive can take a long time, and the functions that call this are expected to execute quickly.
 bool MassStorage::CheckDriveMounted(const char* path)
 {
-	size_t card = (strlen(path) >= 2 && path[1] == ':' && isDigit(path[0]))
-					? path[0] - '0'
+	const size_t card = (strlen(path) >= 2 && path[1] == ':' && isDigit(path[0]))
+						? path[0] - '0'
 						: 0;
 	return card < NumSdCards && info[card].isMounted;
 }
@@ -513,6 +579,7 @@ bool MassStorage::CheckDriveMounted(const char* path)
 // Return true if any files are open on the file system
 bool MassStorage::AnyFileOpen(const FATFS *fs) const
 {
+	MutexLocker lock(fsMutex);
 	for (const FileStore & fil : files)
 	{
 		if (fil.IsOpenOn(fs))
@@ -523,10 +590,11 @@ bool MassStorage::AnyFileOpen(const FATFS *fs) const
 	return false;
 }
 
-// Invalidate all open files on the specified file system, returning true if any files were invalidated
+// Invalidate all open files on the specified file system, returning the number of files that were invalidated
 unsigned int MassStorage::InvalidateFiles(const FATFS *fs, bool doClose)
 {
 	unsigned int invalidated = 0;
+	MutexLocker lock(fsMutex);
 	for (FileStore & fil : files)
 	{
 		if (fil.Invalidate(fs, doClose))
@@ -557,11 +625,13 @@ bool MassStorage::IsCardDetected(size_t card) const
 	return info[card].cardState == CardDetectState::present;
 }
 
-// Unmount a file system returning true if any pen files were invalidated
-bool MassStorage::InternalUnmount(size_t card, bool doClose)
+// Unmount a file system returning the number of open files were invalidated
+unsigned int MassStorage::InternalUnmount(size_t card, bool doClose)
 {
 	SdCardInfo& inf = info[card];
-	const bool invalidated = InvalidateFiles(&inf.fileSystem, doClose);
+	MutexLocker lock1(fsMutex);
+	MutexLocker lock2(inf.volMutex);
+	const unsigned int invalidated = InvalidateFiles(&inf.fileSystem, doClose);
 	f_mount(card, nullptr);
 	memset(&inf.fileSystem, 0, sizeof(inf.fileSystem));
 	sd_mmc_unmount(card);
@@ -572,9 +642,10 @@ bool MassStorage::InternalUnmount(size_t card, bool doClose)
 unsigned int MassStorage::GetNumFreeFiles() const
 {
 	unsigned int numFreeFiles = 0;
+	MutexLocker lock(fsMutex);
 	for (const FileStore & fil : files)
 	{
-		if (!fil.inUse)
+		if (fil.usageMode == FileUseMode::free)
 		{
 			++numFreeFiles;
 		}
@@ -642,13 +713,70 @@ void MassStorage::Spin()
 	}
 
 	// Check if any files are supposed to be closed
-	for (FileStore & fil : files)
 	{
-		if (fil.closeRequested)
+		MutexLocker lock(fsMutex);
+		for (FileStore & fil : files)
 		{
-			// We cannot do this in ISRs, so do it here
-			fil.Close();
+			if (fil.closeRequested)
+			{
+				// We cannot do this in ISRs, so do it here
+				fil.Close();
+			}
 		}
+	}
+}
+
+// Append the simulated printing time to the end of the file
+void MassStorage::RecordSimulationTime(const char *printingFilename, uint32_t simSeconds)
+{
+	const char * const GCodeDir = reprap.GetPlatform().GetGCodeDir();
+	FileStore * const file = OpenFile(GCodeDir, printingFilename, OpenMode::append);
+	bool ok = (file != nullptr);
+	if (ok)
+	{
+		// Check whether there is already simulation info at the end of the file, in which case we should replace it
+		constexpr size_t BufferSize = 100;
+		String<BufferSize> buffer;
+		const size_t bytesToRead = (size_t)min<FilePosition>(file->Length(), BufferSize);
+		const FilePosition seekPos = file->Length() - bytesToRead;
+		ok = file->Seek(seekPos);
+		time_t lastModtime = 0;
+		if (ok)
+		{
+			ok = (file->Read(buffer.GetRef().Pointer(), bytesToRead) == (int)bytesToRead);
+			if (ok)
+			{
+				lastModtime = GetLastModifiedTime(GCodeDir, printingFilename);	// save the last modified time to that we can restore it later
+				buffer[bytesToRead] = 0;										// this is OK because String<N> has N+1 bytes of storage
+				const char* const pos = strstr(buffer.c_str(), FileInfoParser::SimulatedTimeString);
+				if (pos != nullptr)
+				{
+					ok = file->Seek(seekPos + (pos - buffer.c_str()));			// overwrite previous simulation time
+				}
+				if (ok)
+				{
+					buffer.printf("%s: %" PRIu32 "\n", FileInfoParser::SimulatedTimeString, simSeconds);
+					ok = file->Write(buffer.c_str());
+					if (ok)
+					{
+						ok = file->Truncate();									// truncate file in case we overwrote a previous longer simulation time
+					}
+				}
+			}
+		}
+		if (!file->Close())
+		{
+			ok = false;
+		}
+		if (ok && lastModtime != 0)
+		{
+			ok = SetLastModifiedTime(GCodeDir, printingFilename, lastModtime);
+		}
+	}
+
+	if (!ok)
+	{
+		reprap.GetPlatform().MessageF(ErrorMessage, "Failed to append simulated print time to file %s\n", printingFilename);
 	}
 }
 
@@ -668,8 +796,8 @@ MassStorage::InfoResult MassStorage::GetCardInfo(size_t slot, uint64_t& capacity
 
 	capacity = (uint64_t)sd_mmc_get_capacity(slot) * 1024;
 	speed = sd_mmc_get_interface_speed(slot);
-	String<10> path;
-	path.GetRef().printf("%u:/", slot);
+	String<ShortScratchStringLength> path;
+	path.printf("%u:/", slot);
 	uint32_t freeClusters;
 	FATFS *fs;
 	const FRESULT fr = f_getfree(path.c_str(), &freeClusters, &fs);
@@ -685,5 +813,39 @@ MassStorage::InfoResult MassStorage::GetCardInfo(size_t slot, uint64_t& capacity
 	}
 	return InfoResult::ok;
 }
+
+#ifdef RTOS
+
+// Functions called by FatFS to acquire/release mutual exclusion
+extern "C"
+{
+	// Create a sync object. We already created it, we just need to copy the handle.
+	int ff_cre_syncobj (BYTE vol, _SYNC_t* psy)
+	{
+		*psy = &reprap.GetPlatform().GetMassStorage()->GetVolumeMutex(vol);
+		return 1;
+	}
+
+	// Lock sync object
+	int ff_req_grant (_SYNC_t sy)
+	{
+		sy->Take();
+		return 1;
+	}
+
+	// Unlock sync object
+	void ff_rel_grant (_SYNC_t sy)
+	{
+		sy->Release();
+	}
+
+	// Delete a sync object
+	int ff_del_syncobj (_SYNC_t sy)
+	{
+		return 1;		// nothing to do, we never delete the mutex
+	}
+}
+
+#endif
 
 // End

@@ -20,7 +20,6 @@ Licence: GPL
 
 #include "Heat.h"
 #include "HeaterProtection.h"
-//#include "Pins.h"
 #include "Platform.h"
 #include "RepRap.h"
 #include "Sensors/TemperatureSensor.h"
@@ -29,8 +28,26 @@ Licence: GPL
 # include "Sensors/DhtSensor.h"
 #endif
 
+#ifdef RTOS
+
+# include "Tasks.h"
+
+constexpr uint32_t HeaterTaskStackWords = 400;			// task stack size in dwords, must be large enough for auto tuning
+static Task<HeaterTaskStackWords> heaterTask;
+
+extern "C" void HeaterTask(void * pvParameters)
+{
+	reprap.GetHeat().Task();
+}
+
+#endif
+
 Heat::Heat(Platform& p)
-	: platform(p), active(false), coldExtrude(false), heaterBeingTuned(-1), lastHeaterTuned(-1)
+	: platform(p),
+#ifndef RTOS
+	  active(false),
+#endif
+	  coldExtrude(false), heaterBeingTuned(-1), lastHeaterTuned(-1)
 {
 	ARRAY_INIT(bedHeaters, DefaultBedHeaters);
 	ARRAY_INIT(chamberHeaters, DefaultChamberHeaters);
@@ -120,10 +137,19 @@ void Heat::Init()
 	virtualHeaterSensors[2] = TemperatureSensor::Create(FirstTmcDriversSenseChannel + 1);
 #endif
 
-	lastTime = millis() - platform.HeatSampleInterval();		// flag the PIDS as due for spinning
-	longWait = millis();
+#if SUPPORT_DHT_SENSOR
+	// Initialise static fields of the DHT sensor
+	DhtSensorHardwareInterface::InitStatic();
+#endif
+
 	coldExtrude = false;
+
+#ifdef RTOS
+	heaterTask.Create(HeaterTask, "HEAT", nullptr, TaskBase::HeatPriority);
+#else
+	lastTime = millis() - platform.HeatSampleInterval();		// flag the PIDS as due for spinning
 	active = true;
+#endif
 }
 
 void Heat::Exit()
@@ -132,8 +158,39 @@ void Heat::Exit()
 	{
 		pid->SwitchOff();
 	}
+
+#ifdef RTOS
+	heaterTask.Suspend();
+#else
 	active = false;
+#endif
 }
+
+#ifdef RTOS
+
+void Heat::Task()
+{
+	lastWakeTime = xTaskGetTickCount();
+	for (;;)
+	{
+		for (size_t heater = 0; heater < Heaters; heater++)
+		{
+			pids[heater]->Spin();
+		}
+
+		// See if we have finished tuning a PID
+		if (heaterBeingTuned != -1 && !pids[heaterBeingTuned]->IsTuning())
+		{
+			lastHeaterTuned = heaterBeingTuned;
+			heaterBeingTuned = -1;
+		}
+
+		// Delay until it is time again
+		vTaskDelayUntil(&lastWakeTime, platform.HeatSampleInterval());
+	}
+}
+
+#else
 
 void Heat::Spin()
 {
@@ -162,8 +219,9 @@ void Heat::Spin()
 		DhtSensor::Spin();
 #endif
 	}
-	platform.ClassReport(longWait);
 }
+
+#endif
 
 void Heat::Diagnostics(MessageType mtype)
 {
@@ -232,7 +290,7 @@ Heat::HeaterStatus Heat::GetStatus(int8_t heater) const
 
 void Heat::SetBedHeater(size_t index, int8_t heater)
 {
-	const size_t bedHeater = bedHeaters[index];
+	const int bedHeater = bedHeaters[index];
 	if (bedHeater >= 0)
 	{
 		pids[bedHeater]->SwitchOff();
@@ -254,7 +312,7 @@ bool Heat::IsBedHeater(int8_t heater) const
 
 void Heat::SetChamberHeater(size_t index, int8_t heater)
 {
-	const size_t chamberHeater = chamberHeaters[heater];
+	const int chamberHeater = chamberHeaters[heater];
 	if (chamberHeater >= 0)
 	{
 		pids[chamberHeater]->SwitchOff();
@@ -515,17 +573,16 @@ bool Heat::SetHeaterChannel(size_t heater, int channel)
 }
 
 // Configure the temperature sensor for a channel
-bool Heat::ConfigureHeaterSensor(unsigned int mcode, size_t heater, GCodeBuffer& gb, const StringRef& reply, bool& error)
+GCodeResult Heat::ConfigureHeaterSensor(unsigned int mcode, size_t heater, GCodeBuffer& gb, const StringRef& reply)
 {
 	TemperatureSensor ** const spp = GetSensor(heater);
 	if (spp == nullptr || *spp == nullptr)
 	{
 		reply.printf("heater %d is not configured", heater);
-		error = true;
-		return false;
+		return GCodeResult::error;
 	}
 
-	return (*spp)->Configure(mcode, heater, gb, reply, error);
+	return (*spp)->Configure(mcode, heater, gb, reply);
 }
 
 // Get a pointer to the temperature sensor entry, or nullptr if the heater number is bad
@@ -660,7 +717,7 @@ bool Heat::WriteBedAndChamberTempSettings(FileStore *f) const
 	const StringRef buf = bufSpace.GetRef();
 	for (size_t index : ARRAY_INDICES(bedHeaters))
 	{
-		const int8_t bedHeater = bedHeaters[index];
+		const int bedHeater = bedHeaters[index];
 		if (bedHeater >= 0 && pids[bedHeater]->Active() && !pids[bedHeater]->SwitchedOff())
 		{
 			buf.printf("M140 P%u S%.1f\n", index, (double)GetActiveTemperature(bedHeater));
@@ -668,13 +725,13 @@ bool Heat::WriteBedAndChamberTempSettings(FileStore *f) const
 	}
 	for (size_t index : ARRAY_INDICES(chamberHeaters))
 	{
-		const int8_t chamberHeater = chamberHeaters[index];
+		const int chamberHeater = chamberHeaters[index];
 		if (chamberHeater >= 0 && pids[chamberHeater]->Active() && !pids[chamberHeater]->SwitchedOff())
 		{
 			buf.printf("M141 P%u S%.1f\n", index, (double)GetActiveTemperature(chamberHeater));
 		}
 	}
-	return (buf.Length() == 0) || f->Write(buf.Pointer());
+	return (buf.strlen() == 0) || f->Write(buf.c_str());
 }
 
 // End

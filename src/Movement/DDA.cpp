@@ -266,6 +266,7 @@ bool DDA::Init(GCodes::RawMove &nextMove, bool doMotorMapping)
 	}
 
 	xyMoving = false;
+	bool axesMoving = false;
 	bool extruding = false;												// we set this true if extrusion was commanded, even if it is too small to do
 	bool realMove = false;
 	float accelerations[DRIVES];
@@ -286,7 +287,7 @@ bool DDA::Init(GCodes::RawMove &nextMove, bool doMotorMapping)
 		if (drive < numAxes)
 		{
 			delta = endPoint[drive] - positionNow[drive];
-			if (k.IsContinuousRotationAxis(drive))
+			if (k.IsContinuousRotationAxis(drive) && nextMove.moveType != 1 && nextMove.moveType != 2)
 			{
 				const int32_t stepsPerRotation = lrintf(360.0 * reprap.GetPlatform().DriveStepsPerUnit(drive));
 				if (delta > stepsPerRotation/2)
@@ -345,6 +346,10 @@ bool DDA::Init(GCodes::RawMove &nextMove, bool doMotorMapping)
 					}
 				}
 			}
+			else
+			{
+				axesMoving = true;
+			}
 		}
 	}
 
@@ -381,8 +386,8 @@ bool DDA::Init(GCodes::RawMove &nextMove, bool doMotorMapping)
 	xAxes = nextMove.xAxes;
 	yAxes = nextMove.yAxes;
 	endStopsToCheck = nextMove.endStopsToCheck;
-	canPauseBefore = nextMove.canPauseBefore;
 	canPauseAfter = nextMove.canPauseAfter;
+	usingStandardFeedrate = nextMove.usingStandardFeedrate;
 	filePos = nextMove.filePos;
 	isPrintingMove = xyMoving && extruding;
 	usePressureAdvance = nextMove.usePressureAdvance;
@@ -413,18 +418,25 @@ bool DDA::Init(GCodes::RawMove &nextMove, bool doMotorMapping)
 		// This means that the user gets the feed rate that he asked for. It also makes the delta calculations simpler.
 		// First do the bed tilt compensation for deltas.
 		directionVector[Z_AXIS] += (directionVector[X_AXIS] * k.GetTiltCorrection(X_AXIS)) + (directionVector[Y_AXIS] * k.GetTiltCorrection(Y_AXIS));
-
 		totalDistance = NormaliseXYZ();
+	}
+	else if (axesMoving)
+	{
+		// Some axes are moving, but not axes that X or Y are mapped to. Normalise the movement to the vector sum of the axes that are moving.
+		totalDistance = Normalise(directionVector, DRIVES, numAxes);
 	}
 	else
 	{
-		// Extruder-only movement, or movement of additional axes, or a combination.
-		// Currently we normalise vector sum of all drive movement to unit length.
-		// Alternatives would be:
-		// 1. Normalise the largest one to unit length. This means that when retracting multiple filaments, they all get the requested retract speed.
-		// 2. Normalise the sum to unit length. This means that when we use mixing, we get the requested extrusion rate at the nozzle.
-		// 3. Normalise the sum to the sum of the mixing coefficients (which we would have to include in the move details).
-		totalDistance = Normalise(directionVector, DRIVES, DRIVES);
+		// Extruder-only movement. Normalise so that the magnitude is the total absolute movement. This gives the correct feed rate for mixing extruders.
+		totalDistance = 0.0;
+		for (size_t d = 0; d < DRIVES; d++)
+		{
+			totalDistance += fabs(directionVector[d]);
+		}
+		if (totalDistance > 0.0)		// should always be true
+		{
+			Scale(directionVector, 1.0/totalDistance, DRIVES);
+		}
 	}
 
 	// 5. Compute the maximum acceleration available
@@ -536,8 +548,8 @@ bool DDA::Init(const float_t adjustments[DRIVES])
 	isPrintingMove = false;
 	xyMoving = false;
 	endStopsToCheck = 0;
-	canPauseBefore = true;
 	canPauseAfter = true;
+	usingStandardFeedrate = false;
 	usePressureAdvance = false;
 	virtualExtruderPosition = prev->virtualExtruderPosition;
 	hadLookaheadUnderrun = false;
@@ -895,7 +907,7 @@ void DDA::RecalculateMove()
 
 	// We need to set the number of clocks needed here because we use it before the move has been frozen
 	const float totalTime = (2 * topSpeed - startSpeed - endSpeed)/acceleration + (totalDistance - accelDistance - decelDistance)/topSpeed;
-	clocksNeeded = (uint32_t)(totalTime * stepClockRate);
+	clocksNeeded = (uint32_t)(totalTime * StepClockRate);
 }
 
 // Decide what speed we would really like this move to end at.
@@ -1025,10 +1037,10 @@ void DDA::Prepare(uint8_t simMode)
 		const float accelStopTime = (topSpeed - startSpeed)/acceleration;
 		const float decelStartTime = accelStopTime + (params.decelStartDistance - accelDistance)/topSpeed;
 
-		startSpeedTimesCdivA = (uint32_t)roundU32((startSpeed * stepClockRate)/acceleration);
-		params.topSpeedTimesCdivA = (uint32_t)roundU32((topSpeed * stepClockRate)/acceleration);
-		topSpeedTimesCdivAPlusDecelStartClocks = params.topSpeedTimesCdivA + (uint32_t)roundU32(decelStartTime * stepClockRate);
-		extraAccelerationClocks = roundS32((accelStopTime - (accelDistance/topSpeed)) * stepClockRate);
+		startSpeedTimesCdivA = (uint32_t)roundU32((startSpeed * StepClockRate)/acceleration);
+		params.topSpeedTimesCdivA = (uint32_t)roundU32((topSpeed * StepClockRate)/acceleration);
+		topSpeedTimesCdivAPlusDecelStartClocks = params.topSpeedTimesCdivA + (uint32_t)roundU32(decelStartTime * StepClockRate);
+		extraAccelerationClocks = roundS32((accelStopTime - (accelDistance/topSpeed)) * StepClockRate);
 		params.compFactor = (topSpeed - startSpeed)/topSpeed;
 
 		firstDM = nullptr;
@@ -1301,18 +1313,20 @@ void DDA::CheckEndstops(Platform& platform)
 #if HAS_STALL_DETECT
 									DRIVES
 #else
-									numAxes
+									((endStopsToCheck & UseSpecialEndstop) == 0 ? numAxes : DRIVES)
 #endif
 											; ++drive)
 	{
 		if (IsBitSet(endStopsToCheck, drive))
 		{
-			const EndStopHit esh = platform.Stopped(drive);
+			const EndStopHit esh = ((endStopsToCheck & UseSpecialEndstop) != 0 && drive >= numAxes)
+					? (platform.EndStopInputState(drive) ? EndStopHit::lowHit : EndStopHit::noStop)
+							: platform.Stopped(drive);
 			switch (esh)
 			{
 			case EndStopHit::lowHit:
 			case EndStopHit::highHit:
-				if ((endStopsToCheck & UseSpecialEndstop) != 0)			// use only one (probably non-default) endstop while probing a tool offset
+				if ((endStopsToCheck & UseSpecialEndstop) != 0)			// use non-default endstop while probing a tool offset
 				{
 					MoveAborted();
 				}
@@ -1440,7 +1454,7 @@ pre(state == frozen)
 	return true;	// schedule another interrupt immediately
 }
 
-uint32_t DDA::maxReps = 0;					// this holds he maximum ISR loop count
+uint32_t DDA::numHiccups = 0;
 uint32_t DDA::lastStepLowTime = 0;
 uint32_t DDA::lastDirChangeTime = 0;
 
@@ -1452,8 +1466,8 @@ bool DDA::Step()
 {
 	Platform& platform = reprap.GetPlatform();
 	uint32_t lastStepPulseTime = lastStepLowTime;
-	bool repeat;
-	uint32_t numReps = 0;
+	bool repeat = false;
+	uint32_t isrStartTime;
 	do
 	{
 		// Keep this loop as fast as possible, in the case that there are no endstops to check!
@@ -1469,12 +1483,16 @@ bool DDA::Step()
 		}
 
 		// 2. Determine which drivers are due for stepping, overdue, or will be due very shortly
+		const uint32_t iClocks = Platform::GetInterruptClocks();
+		if (!repeat)
+		{
+			isrStartTime = iClocks;		// first time through, so make a note of the ISR start time
+		}
+		const uint32_t elapsedTime = (iClocks - moveStartTime) + MinInterruptInterval;
 		DriveMovement* dm = firstDM;
-		const uint32_t elapsedTime = (Platform::GetInterruptClocks() - moveStartTime) + MinInterruptInterval;
 		uint32_t driversStepping = 0;
 		while (dm != nullptr && elapsedTime >= dm->nextStepTime)		// if the next step is due
 		{
-			++numReps;
 			driversStepping |= platform.GetDriversBitmap(dm->drive);
 			dm = dm->nextDM;
 
@@ -1483,7 +1501,7 @@ bool DDA::Step()
 //if (t3 < minCalcTime) minCalcTime = t3;
 		}
 
-		if ((driversStepping & platform.GetSlowDriversBitmap()) == 0)			// if not using any external drivers
+		if ((driversStepping & platform.GetSlowDriversBitmap()) == 0)	// if not using any external drivers
 		{
 			// 3. Step the drivers
 			Platform::StepDriversHigh(driversStepping);					// generate the steps
@@ -1534,14 +1552,22 @@ bool DDA::Step()
 			break;
 		}
 
-		// 7. Schedule next interrupt, or if it would be too soon, generate more steps immediately
-		repeat = platform.ScheduleStepInterrupt(firstDM->nextStepTime + moveStartTime);
-	} while (repeat);
+		// 7. Check whether we have been in this ISR for too long already and need to take a break
+		uint32_t nextStepDue = firstDM->nextStepTime + moveStartTime;
+		const uint32_t clocksTaken = (Platform::GetInterruptClocks16() - isrStartTime) & 0x0000FFFF;
+		if (clocksTaken >= DDA::MaxStepInterruptTime && (nextStepDue - isrStartTime) < (clocksTaken + DDA::MinInterruptInterval))
+		{
+			// Force a break by updating the move start time
+			const uint32_t delayClocks = (clocksTaken + DDA::MinInterruptInterval) - (nextStepDue - isrStartTime);
+			moveStartTime += delayClocks;
+			nextStepDue += delayClocks;
+			++numHiccups;
+		}
 
-	if (numReps > maxReps)
-	{
-		maxReps = numReps;
-	}
+		// 8. Schedule next interrupt, or if it would be too soon, generate more steps immediately
+		// If we have already spent too much time in the ISR, delay the interrupt
+		repeat = platform.ScheduleStepInterrupt(nextStepDue);
+	} while (repeat);
 
 	if (state == completed)
 	{

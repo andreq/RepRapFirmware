@@ -32,6 +32,7 @@
 #include "Version.h"
 #include "SoftTimer.h"
 #include "Logger.h"
+#include "Tasks.h"
 #include "Libraries/Math/Isqrt.h"
 #include "Wire.h"
 
@@ -55,10 +56,8 @@
 #endif
 
 #include <climits>
-#include <malloc.h>
 
-extern char _end;
-extern "C" char *sbrk(int i);
+extern uint32_t _estack;			// defined in the linker script
 
 #if !defined(HAS_LWIP_NETWORKING) || !defined(HAS_WIFI_NETWORKING) || !defined(HAS_CPU_TEMP_SENSOR) || !defined(HAS_HIGH_SPEED_SD) \
  || !defined(HAS_SMART_DRIVERS) || !defined(HAS_STALL_DETECT) || !defined(HAS_VOLTAGE_MONITOR) || !defined(HAS_VREF_MONITOR) || !defined(ACTIVE_LOW_HEAT_ON) \
@@ -107,8 +106,6 @@ constexpr uint16_t driverNormalVoltageAdcReading = PowerVoltageToAdcReading(27.5
 
 #endif
 
-const uint8_t memPattern = 0xA5;
-
 static uint32_t fanInterruptCount = 0;				// accessed only in ISR, so no need to declare it volatile
 const uint32_t fanMaxInterruptCount = 32;			// number of fan interrupts that we average over
 static volatile uint32_t fanLastResetTime = 0;		// time (microseconds) at which we last reset the interrupt count, accessed inside and outside ISR
@@ -148,7 +145,7 @@ uint32_t lastSoftTimerInterruptScheduledAt = 0;
 // Urgent initialisation function
 // This is called before general init has been done, and before constructors for C++ static data have been called.
 // Therefore, be very careful what you do here!
-void UrgentInit()
+extern "C" void UrgentInit()
 {
 #if defined(DUET_NG)
 	// When the reset button is pressed on pre-production Duet WiFi boards, if the TMC2660 drivers were previously enabled then we get
@@ -172,132 +169,6 @@ void UrgentInit()
 #endif
 }
 
-// Arduino initialise and loop functions
-// Put nothing in these other than calls to the RepRap equivalents
-void setup()
-{
-	// Fill the free memory with a pattern so that we can check for stack usage and memory corruption
-	char* heapend = sbrk(0);
-	register const char * stack_ptr asm ("sp");
-	while (heapend + 16 < stack_ptr)
-	{
-		*heapend++ = memPattern;
-	}
-
-	// Trap integer divide-by-zero.
-	// We could also trap unaligned memory access, if we change the gcc options to not generate code that uses unaligned memory access.
-	SCB->CCR |= SCB_CCR_DIV_0_TRP_Msk;
-
-	// When doing a software reset, we disable the NRST input (User reset) to prevent the negative-going pulse that gets generated on it
-	// being held in the capacitor and changing the reset reason from Software to User. So enable it again here. We hope that the reset signal
-	// will have gone away by now.
-#ifndef RSTC_MR_KEY_PASSWD
-// Definition of RSTC_MR_KEY_PASSWD is missing in the SAM3X ASF files
-# define RSTC_MR_KEY_PASSWD (0xA5u << 24)
-#endif
-	RSTC->RSTC_MR = RSTC_MR_KEY_PASSWD | RSTC_MR_URSTEN;	// ignore any signal on the NRST pin for now so that the reset reason will show as Software
-
-#if USE_CACHE
-	// Enable the cache
-	struct cmcc_config g_cmcc_cfg;
-	cmcc_get_config_defaults(&g_cmcc_cfg);
-	cmcc_init(CMCC, &g_cmcc_cfg);
-	EnableCache();
-#endif
-
-	// Go on and do the main initialisation
-	reprap.Init();
-}
-
-void loop()
-{
-	reprap.Spin();
-}
-
-extern "C"
-{
-	// This intercepts the 1ms system tick. It must return 'false', otherwise the Arduino core tick handler will be bypassed.
-	int sysTickHook()
-	{
-		reprap.Tick();
-		return 0;
-	}
-
-	// Exception handlers
-	// By default the Usage Fault, Bus Fault and Memory Management fault handlers are not enabled,
-	// so they escalate to a Hard Fault and we don't need to provide separate exception handlers for them.
-	void hardFaultDispatcher(const uint32_t *pulFaultStackAddress)
-	{
-	    reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::hardFault, pulFaultStackAddress + 5);
-	}
-
-	// The fault handler implementation calls a function called hardFaultDispatcher()
-	void HardFault_Handler() __attribute__((naked));
-	void HardFault_Handler()
-	{
-	    __asm volatile
-	    (
-	        " tst lr, #4                                                \n"		/* test bit 2 of the EXC_RETURN in LR to determine which stack was in use */
-	        " ite eq                                                    \n"		/* load the appropriate stack pointer into R0 */
-	        " mrseq r0, msp                                             \n"
-	        " mrsne r0, psp                                             \n"
-	        " ldr r2, handler_hf_address_const                          \n"
-	        " bx r2                                                     \n"
-	        " handler_hf_address_const: .word hardFaultDispatcher       \n"
-	    );
-	}
-
-	void wdtFaultDispatcher(const uint32_t *pulFaultStackAddress)
-	{
-	    reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::wdtFault, pulFaultStackAddress + 5);
-	}
-
-	void WDT_Handler() __attribute__((naked));
-	void WDT_Handler()
-	{
-	    __asm volatile
-	    (
-	        " tst lr, #4                                                \n"		/* test bit 2 of the EXC_RETURN in LR to determine which stack was in use */
-	        " ite eq                                                    \n"		/* load the appropriate stack pointer into R0 */
-	        " mrseq r0, msp                                             \n"
-	        " mrsne r0, psp                                             \n"
-	        " ldr r2, handler_wdt_address_const                         \n"
-	        " bx r2                                                     \n"
-	        " handler_wdt_address_const: .word wdtFaultDispatcher       \n"
-	    );
-	}
-
-	void otherFaultDispatcher(const uint32_t *pulFaultStackAddress)
-	{
-	    reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::otherFault, pulFaultStackAddress + 5);
-	}
-
-	// The fault handler implementation calls a function called otherFaultDispatcher()
-	void OtherFault_Handler() __attribute__((naked));
-	void OtherFault_Handler()
-	{
-	    __asm volatile
-	    (
-	        " tst lr, #4                                                \n"		/* test bit 2 of the EXC_RETURN in LR to determine which stack was in use */
-	        " ite eq                                                    \n"		/* load the appropriate stack pointer into R0 */
-	        " mrseq r0, msp                                             \n"
-	        " mrsne r0, psp                                             \n"
-	        " ldr r2, handler_oflt_address_const                        \n"
-	        " bx r2                                                     \n"
-	        " handler_oflt_address_const: .word otherFaultDispatcher    \n"
-	    );
-	}
-
-	// We could set up the following fault handlers to retrieve the program counter in the same way as for a Hard Fault,
-	// however these exceptions are unlikely to occur, so for now we just report the exception type.
-	void NMI_Handler        () { reprap.GetPlatform().SoftwareReset((uint16_t)SoftwareResetReason::NMI); }
-
-	// 2017-05-25: A user is getting 'otherFault' reports, so now we do a stack dump for those too.
-	void SVC_Handler		() __attribute__ ((alias("OtherFault_Handler")));
-	void DebugMon_Handler   () __attribute__ ((alias("OtherFault_Handler")));
-	void PendSV_Handler		() __attribute__ ((alias("OtherFault_Handler")));
-}
-
 //*************************************************************************************************
 // Platform class
 
@@ -311,13 +182,6 @@ Platform::Platform() :
 #endif
 		lastFanCheckTime(0), auxGCodeReply(nullptr), tickState(0), debugCode(0), lastWarningMillis(0), deliberateError(false), i2cInitialised(false)
 {
-	// Output
-	auxOutput = new OutputStack();
-#ifdef SERIAL_AUX2_DEVICE
-	aux2Output = new OutputStack();
-#endif
-	usbOutput = new OutputStack();
-
 	// Files
 	massStorage = new MassStorage(this);
 }
@@ -327,6 +191,11 @@ Platform::Platform() :
 // Initialise the Platform. Note: this is the first module to be initialised, so don't call other modules from here!
 void Platform::Init()
 {
+	if (DiagPin != NoPin)
+	{
+		pinMode(DiagPin, OUTPUT_LOW);				// set up diag LED for debugging and turn it off
+	}
+
 	// Deal with power first
 	pinMode(ATX_POWER_PIN, OUTPUT_LOW);
 	deferredPowerDown = false;
@@ -348,6 +217,8 @@ void Platform::Init()
 	commsParams[2] = 0;
 #endif
 
+	usbMutex.Create("USB");
+	auxMutex.Create("Aux");
 	auxDetected = false;
 	auxSeq = 0;
 
@@ -355,6 +226,7 @@ void Platform::Init()
 	SERIAL_AUX_DEVICE.begin(baudRates[1]);		// this can't be done in the constructor because the Arduino port initialisation isn't complete at that point
 #ifdef SERIAL_AUX2_DEVICE
 	SERIAL_AUX2_DEVICE.begin(baudRates[2]);
+	aux2Mutex.Create("Aux2");
 #endif
 
 	compatibility = Compatibility::marlin;		// default to Marlin because the common host programs expect the "OK" response to commands
@@ -369,6 +241,7 @@ void Platform::Init()
 #if SAM4E || SAM4S || SAME70
 	// Read the unique ID of the MCU
 	memset(uniqueId, 0, sizeof(uniqueId));
+
 	DisableCache();
 	cpu_irq_disable();
 	const uint32_t rc = flash_read_unique_id(uniqueId, 4);
@@ -706,7 +579,6 @@ void Platform::Init()
 	memset(logicalPinModes, PIN_MODE_NOT_CONFIGURED, sizeof(logicalPinModes));		// set all pins to "not configured"
 
 	// Kick everything off
-	longWait = millis();
 	InitialiseInterrupts();		// also sets 'active' to true
 }
 
@@ -753,6 +625,7 @@ void Platform::InitZProbe()
 	case ZProbeType::digital:
 	case ZProbeType::unfilteredDigital:
 	case ZProbeType::blTouch:
+	case ZProbeType::zMotorStall:
 	default:
 		AnalogInEnableChannel(zProbeAdcChannel, false);
 		pinMode(zProbePin, INPUT_PULLUP);
@@ -802,6 +675,19 @@ int Platform::GetZProbeReading() const
 
 		case ZProbeType::unfilteredDigital:		// Switch connected to Z probe input, no filtering
 			zProbeVal = GetRawZProbeReading()/4;
+			break;
+
+		case ZProbeType::zMotorStall:
+#if HAS_STALL_DETECT
+			{
+				const bool stalled = (reprap.GetMove().GetKinematics().GetKinematicsType() == KinematicsType::coreXZ)
+										? AnyAxisMotorStalled(X_AXIS) || AnyAxisMotorStalled(Z_AXIS)
+										: AnyAxisMotorStalled(Z_AXIS);
+				zProbeVal = (stalled) ? 1000 : 0;
+			}
+#else
+			zProbeVal = 1000;
+#endif
 			break;
 
 		default:
@@ -892,6 +778,7 @@ const ZProbe& Platform::GetZProbeParameters(ZProbeType probeType) const
 	case ZProbeType::digital:
 	case ZProbeType::unfilteredDigital:
 	case ZProbeType::blTouch:
+	case ZProbeType::zMotorStall:
 		return irZProbeParameters;
 	case ZProbeType::alternateAnalog:
 		return alternateZProbeParameters;
@@ -912,6 +799,7 @@ void Platform::SetZProbeParameters(ZProbeType probeType, const ZProbe& params)
 	case ZProbeType::digital:
 	case ZProbeType::unfilteredDigital:
 	case ZProbeType::blTouch:
+	case ZProbeType::zMotorStall:
 		irZProbeParameters = params;
 		break;
 
@@ -1187,7 +1075,7 @@ void Platform::UpdateFirmware()
 	}
 
 #if defined(DUET_NG) || defined(DUET_M)
-	IoPort::WriteDigital(Z_PROBE_MOD_PIN, false);	// turn the DIAG LED off
+	IoPort::WriteDigital(DiagPin, false);			// turn the DIAG LED off
 #endif
 
 	wdt_restart(WDT);								// kick the watchdog one last time
@@ -1206,7 +1094,16 @@ void Platform::UpdateFirmware()
 	cpu_irq_enable();
 
 	__asm volatile ("mov r3, %0" : : "r" (IAP_FLASH_START) : "r3");
+#ifdef RTOS
+	// We are using separate process and handler stacks. Put the process stack 1K bytes below the handler stack.
+	__asm volatile ("ldr r1, [r3]");
+	__asm volatile ("msr msp, r1");
+	__asm volatile ("sub r1, #1024");
+	__asm volatile ("mov sp, r1");
+#else
 	__asm volatile ("ldr sp, [r3]");
+#endif
+	__asm volatile ("isb");
 	__asm volatile ("ldr r1, [r3, #4]");
 	__asm volatile ("orr r1, r1, #1");
 	__asm volatile ("bx r1");
@@ -1227,7 +1124,7 @@ void Platform::SendAuxMessage(const char* msg)
 		buf->copy("{\"message\":");
 		buf->EncodeString(msg, strlen(msg), false, true);
 		buf->cat("}\n");
-		auxOutput->Push(buf);
+		auxOutput.Push(buf);
 		FlushAuxMessages();
 	}
 }
@@ -1304,7 +1201,8 @@ void Platform::SetNetMask(uint8_t nm[])
 bool Platform::FlushAuxMessages()
 {
 	// Write non-blocking data to the AUX line
-	OutputBuffer *auxOutputBuffer = auxOutput->GetFirstItem();
+	MutexLocker lock(auxMutex);
+	OutputBuffer *auxOutputBuffer = auxOutput.GetFirstItem();
 	if (auxOutputBuffer != nullptr)
 	{
 		const size_t bytesToWrite = min<size_t>(SERIAL_AUX_DEVICE.canWrite(), auxOutputBuffer->BytesLeft());
@@ -1316,10 +1214,10 @@ bool Platform::FlushAuxMessages()
 		if (auxOutputBuffer->BytesLeft() == 0)
 		{
 			auxOutputBuffer = OutputBuffer::Release(auxOutputBuffer);
-			auxOutput->SetFirstItem(auxOutputBuffer);
+			auxOutput.SetFirstItem(auxOutputBuffer);
 		}
 	}
-	return auxOutput->GetFirstItem() != nullptr;
+	return auxOutput.GetFirstItem() != nullptr;
 }
 
 // Flush messages to USB and aux, returning true if there is more to send
@@ -1329,55 +1227,65 @@ bool Platform::FlushMessages()
 
 #ifdef SERIAL_AUX2_DEVICE
 	// Write non-blocking data to the second AUX line
-	OutputBuffer *aux2OutputBuffer = aux2Output->GetFirstItem();
-	if (aux2OutputBuffer != nullptr)
+	bool aux2HasMore;
 	{
-		size_t bytesToWrite = min<size_t>(SERIAL_AUX2_DEVICE.canWrite(), aux2OutputBuffer->BytesLeft());
-		if (bytesToWrite > 0)
+		MutexLocker lock(aux2Mutex);
+		OutputBuffer *aux2OutputBuffer = aux2Output.GetFirstItem();
+		if (aux2OutputBuffer != nullptr)
 		{
-			SERIAL_AUX2_DEVICE.write(aux2OutputBuffer->Read(bytesToWrite), bytesToWrite);
-		}
+			size_t bytesToWrite = min<size_t>(SERIAL_AUX2_DEVICE.canWrite(), aux2OutputBuffer->BytesLeft());
+			if (bytesToWrite > 0)
+			{
+				SERIAL_AUX2_DEVICE.write(aux2OutputBuffer->Read(bytesToWrite), bytesToWrite);
+			}
 
-		if (aux2OutputBuffer->BytesLeft() == 0)
-		{
-			aux2OutputBuffer = OutputBuffer::Release(aux2OutputBuffer);
-			aux2Output->SetFirstItem(aux2OutputBuffer);
+			if (aux2OutputBuffer->BytesLeft() == 0)
+			{
+				aux2OutputBuffer = OutputBuffer::Release(aux2OutputBuffer);
+				aux2Output.SetFirstItem(aux2OutputBuffer);
+			}
 		}
+		aux2HasMore = (aux2Output.GetFirstItem() != nullptr);
 	}
 #endif
 
 	// Write non-blocking data to the USB line
-	OutputBuffer *usbOutputBuffer = usbOutput->GetFirstItem();
-	if (usbOutputBuffer != nullptr)
+	bool usbHasMore;
 	{
-		if (!SERIAL_MAIN_DEVICE)
+		MutexLocker lock(usbMutex);
+		OutputBuffer *usbOutputBuffer = usbOutput.GetFirstItem();
+		if (usbOutputBuffer != nullptr)
 		{
-			// If the USB port is not opened, free the data left for writing
-			OutputBuffer::ReleaseAll(usbOutputBuffer);
-			usbOutput->SetFirstItem(nullptr);
-		}
-		else
-		{
-			// Write as much data as we can...
-			size_t bytesToWrite = min<size_t>(SERIAL_MAIN_DEVICE.canWrite(), usbOutputBuffer->BytesLeft());
-			if (bytesToWrite > 0)
+			if (!SERIAL_MAIN_DEVICE)
 			{
-				SERIAL_MAIN_DEVICE.write(usbOutputBuffer->Read(bytesToWrite), bytesToWrite);
+				// If the USB port is not opened, free the data left for writing
+				OutputBuffer::ReleaseAll(usbOutputBuffer);
+				(void) usbOutput.Pop();
 			}
+			else
+			{
+				// Write as much data as we can...
+				size_t bytesToWrite = min<size_t>(SERIAL_MAIN_DEVICE.canWrite(), usbOutputBuffer->BytesLeft());
+				if (bytesToWrite > 0)
+				{
+					SERIAL_MAIN_DEVICE.write(usbOutputBuffer->Read(bytesToWrite), bytesToWrite);
+				}
 
-			if (usbOutputBuffer->BytesLeft() == 0 || usbOutputBuffer->GetAge() > SERIAL_MAIN_TIMEOUT)
-			{
-				usbOutputBuffer = OutputBuffer::Release(usbOutputBuffer);
-				usbOutput->SetFirstItem(usbOutputBuffer);
+				if (usbOutputBuffer->BytesLeft() == 0 || usbOutputBuffer->GetAge() > SERIAL_MAIN_TIMEOUT)
+				{
+					usbOutputBuffer = OutputBuffer::Release(usbOutputBuffer);
+					usbOutput.SetFirstItem(usbOutputBuffer);
+				}
 			}
 		}
+		usbHasMore = (usbOutput.GetFirstItem() != nullptr);
 	}
 
 	return auxHasMore
 #ifdef SERIAL_AUX2_DEVICE
-		|| aux2Output->GetFirstItem() != nullptr
+		|| aux2HasMore
 #endif
-		|| usbOutput->GetFirstItem() != nullptr;
+		|| usbHasMore;
 }
 
 void Platform::Spin()
@@ -1474,7 +1382,7 @@ void Platform::Spin()
 				{
 					if ((stalledDrivers & mask) == 0)
 					{
-						// This stall is new and we are printing, so check whether we need to perform some action in response to the stall
+						// This stall is new so check whether we need to perform some action in response to the stall
 						if ((rehomeOnStallDrivers & mask) != 0)
 						{
 							stalledDriversToRehome |= mask;
@@ -1588,12 +1496,12 @@ void Platform::Spin()
 			// Check for stalled drivers that need to be reported and logged
 			if (stalledDriversToLog != 0 && reprap.GetGCodes().IsReallyPrinting())
 			{
-				scratchString.Clear();
-				ListDrivers(scratchString, stalledDriversToLog);
+				String<ScratchStringLength> scratchString;
+				ListDrivers(scratchString.GetRef(), stalledDriversToLog);
 				stalledDriversToLog = 0;
 				float liveCoordinates[DRIVES];
 				reprap.GetMove().LiveCoordinates(liveCoordinates, reprap.GetCurrentXAxes(), reprap.GetCurrentYAxes());
-				MessageF(WarningMessage, "Driver(s)%s stalled at Z height %.2f", scratchString.Pointer(), (double)liveCoordinates[Z_AXIS]);
+				MessageF(WarningMessage, "Driver(s)%s stalled at Z height %.2f", scratchString.c_str(), (double)liveCoordinates[Z_AXIS]);
 				reported = true;
 			}
 #endif
@@ -1622,13 +1530,9 @@ void Platform::Spin()
 				reported = true;
 			}
 #elif defined(DUET_NG)
-			if (
-# if defined(DUET_WIFI)
-				board == BoardType::DuetWiFi_102
-# elif defined(DUET_ETHERNET)
-				board == BoardType::DuetEthernet_102
-# endif
-				&& digitalRead(VssaSensePin))
+			if (   (board == BoardType::DuetWiFi_102 || board == BoardType::DuetEthernet_102)
+				&& digitalRead(VssaSensePin)
+			   )
 			{
 				Message(ErrorMessage, "VSSA fault, check thermistor wiring\n");
 				reported = true;
@@ -1648,7 +1552,8 @@ void Platform::Spin()
 		switch (autoSaveState)
 		{
 		case AutoSaveState::starting:
-			if (currentVin >= autoResumeReading)
+			// Some users set the auto resume threshold high to disable auto resume, so prime auto save at the auto save threshold plus half a volt
+			if (currentVin >= autoResumeReading || currentVin > autoPauseReading + PowerVoltageToAdcReading(0.5))
 			{
 				autoSaveState = AutoSaveState::normal;
 			}
@@ -1685,8 +1590,6 @@ void Platform::Spin()
 	{
 		logger->Flush(false);
 	}
-
-	ClassReport(longWait);
 }
 
 #if HAS_SMART_DRIVERS
@@ -1697,6 +1600,7 @@ void Platform::ReportDrivers(MessageType mt, DriversBitmap whichDrivers, const c
 {
 	if (whichDrivers != 0)
 	{
+		String<ScratchStringLength> scratchString;
 		scratchString.printf("%s on drivers", text);
 		for (unsigned int drive = 0; whichDrivers != 0; ++drive)
 		{
@@ -1706,7 +1610,7 @@ void Platform::ReportDrivers(MessageType mt, DriversBitmap whichDrivers, const c
 			}
 			whichDrivers >>= 1;
 		}
-		MessageF(mt, "%s\n", scratchString.Pointer());
+		MessageF(mt, "%s\n", scratchString.c_str());
 		reported = true;
 	}
 }
@@ -1723,21 +1627,21 @@ bool Platform::AnyAxisMotorStalled(size_t drive) const
 	{
 		for (size_t i = 0; i < axisDrivers[drive].numDrivers; ++i)
 		{
-			if ((SmartDrivers::GetLiveStatus(axisDrivers[drive].driverNumbers[i]) & TMC_RR_SG) != 0)
+			const uint8_t driver = axisDrivers[drive].driverNumbers[i];
+			if (driver < DRIVES && (SmartDrivers::GetLiveStatus(driver) & TMC_RR_SG) != 0)
 			{
 				return true;
 			}
 		}
-		return false;
 	}
-
-	return (SmartDrivers::GetLiveStatus(extruderDrivers[drive - numAxes]) & TMC_RR_SG) != 0;
+	return false;
 }
 
 // Return true if the motor driving this extruder is stalled
 bool Platform::ExtruderMotorStalled(size_t extruder) const pre(drive < DRIVES)
 {
-	return (SmartDrivers::GetLiveStatus(extruderDrivers[extruder]) & TMC_RR_SG) != 0;
+	const uint8_t driver = extruderDrivers[extruder];
+	return driver < DRIVES && (SmartDrivers::GetLiveStatus(driver) & TMC_RR_SG) != 0;
 }
 
 #endif
@@ -1752,6 +1656,11 @@ void Platform::DisableAutoSave()
 bool Platform::IsPowerOk() const
 {
 	return !autoSaveEnabled || currentVin > autoPauseReading;
+}
+
+bool Platform::HasVinPower() const
+{
+	return driversPowered;			// not quite right because drivers are disabled if we get over-voltage too, but OK for the status report
 }
 
 void Platform::EnableAutoSave(float saveVoltage, float resumeVoltage)
@@ -1877,7 +1786,7 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 		srdBuf[slot].magic = SoftwareResetData::magicValue;
 		srdBuf[slot].resetReason = reason;
 		srdBuf[slot].when = (uint32_t)realTime;			// some compilers/libraries use 64-bit time_t
-		GetStackUsage(nullptr, nullptr, &srdBuf[slot].neverUsedRam);
+		srdBuf[slot].neverUsedRam = Tasks::GetNeverUsedRam();
 		srdBuf[slot].hfsr = SCB->HFSR;
 		srdBuf[slot].cfsr = SCB->CFSR;
 		srdBuf[slot].icsr = SCB->ICSR;
@@ -1887,7 +1796,8 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 			srdBuf[slot].sp = reinterpret_cast<uint32_t>(stk);
 			for (size_t i = 0; i < ARRAY_SIZE(srdBuf[slot].stack); ++i)
 			{
-				srdBuf[slot].stack[i] = stk[i];
+				srdBuf[slot].stack[i] = (stk < &_estack) ? *stk : 0xFFFFFFFF;
+				++stk;
 			}
 		}
 
@@ -1899,6 +1809,10 @@ void Platform::SoftwareReset(uint16_t reason, const uint32_t *stk)
 #endif
 	}
 
+#ifndef RSTC_MR_KEY_PASSWD
+// Definition of RSTC_MR_KEY_PASSWD is missing in the SAM3X ASF files
+# define RSTC_MR_KEY_PASSWD (0xA5u << 24)
+#endif
 	RSTC->RSTC_MR = RSTC_MR_KEY_PASSWD;			// ignore any signal on the NRST pin for now so that the reset reason will show as Software
 	Reset();
 	for(;;) {}
@@ -1922,7 +1836,7 @@ static void FanInterrupt(CallbackParameter)
 	++fanInterruptCount;
 	if (fanInterruptCount == fanMaxInterruptCount)
 	{
-		const uint32_t now = micros();
+		const uint32_t now = Platform::GetInterruptClocks();
 		fanInterval = now - fanLastResetTime;
 		fanLastResetTime = now;
 		fanInterruptCount = 0;
@@ -1935,8 +1849,12 @@ void Platform::InitialiseInterrupts()
 	NVIC_SetPriority(WDT_IRQn, NvicPriorityWatchdog);			// set priority for watchdog interrupts
 #endif
 
+#ifdef RTOS
+	NVIC_SetPriority(HSMCI_IRQn, NvicPriorityHSMCI);			// set priority for SD interface interrupts
+#else
 	// Set the tick interrupt to the highest priority. We need to to monitor the heaters and kick the watchdog.
 	NVIC_SetPriority(SysTick_IRQn, NvicPrioritySystick);		// set priority for tick interrupts
+#endif
 
 #if SAM4E || SAME70
 	NVIC_SetPriority(UART0_IRQn, NvicPriorityPanelDueUart);		// set priority for UART interrupt
@@ -2119,43 +2037,6 @@ void Platform::Diagnostics(MessageType mtype)
 
 	Message(mtype, "=== Platform ===\n");
 
-	// Print the firmware version and board type
-	MessageF(mtype, "%s version %s running on %s", FIRMWARE_NAME, VERSION, GetElectronicsString());
-
-#ifdef DUET_NG
-	const char* const expansionName = DuetExpansion::GetExpansionBoardName();
-	if (expansionName != nullptr)
-	{
-		MessageF(mtype, " + %s", expansionName);
-	}
-#endif
-
-	Message(mtype, "\n");
-
-#if SAM4E || SAM4S || SAME70
-	PrintUniqueId(mtype);
-#endif
-
-	// Print memory stats and error codes to USB and copy them to the current webserver reply
-	const char *ramstart =
-#if SAME70
-			(char *) 0x20400000;
-#elif SAM4E || SAM4S
-			(char *) 0x20000000;
-#elif SAM3XA
-			(char *) 0x20070000;
-#else
-# error Unsupported processor
-#endif
-	const struct mallinfo mi = mallinfo();
-	MessageF(mtype, "Static ram used: %d\n", &_end - ramstart);
-	MessageF(mtype, "Dynamic ram used: %d\n", mi.uordblks);
-	MessageF(mtype, "Recycled dynamic ram: %d\n", mi.fordblks);
-	uint32_t currentStack, maxStack, neverUsed;
-	GetStackUsage(&currentStack, &maxStack, &neverUsed);
-	MessageF(mtype, "Stack ram used: %" PRIu32 " current, %" PRIu32 " maximum\n", currentStack, maxStack);
-	MessageF(mtype, "Never used ram: %" PRIu32 "\n", neverUsed);
-
 	// Show the up time and reason for the last reset
 	const uint32_t now = (uint32_t)(millis64()/1000u);		// get up time in seconds
 	const char* resetReasons[8] = { "power up", "backup", "watchdog", "software",
@@ -2209,7 +2090,10 @@ void Platform::Diagnostics(MessageType mtype)
 													: (reason == (uint32_t)SoftwareResetReason::stuckInSpin) ? "Stuck in spin loop"
 														: (reason == (uint32_t)SoftwareResetReason::wdtFault) ? "Watchdog timeout"
 															: (reason == (uint32_t)SoftwareResetReason::otherFault) ? "Other fault"
-																: "Unknown";
+																: (reason == (uint32_t)SoftwareResetReason::stackOverflow) ? "Stack overflow"
+																	: (reason == (uint32_t)SoftwareResetReason::assertCalled) ? "Assertion failed"
+																		: "Unknown";
+			String<ScratchStringLength> scratchString;
 			if (srdBuf[slot].when != 0)
 			{
 				const time_t when = (time_t)srdBuf[slot].when;
@@ -2223,7 +2107,7 @@ void Platform::Diagnostics(MessageType mtype)
 			}
 
 			MessageF(mtype, "Last software reset %s, reason: %s%s, spinning module %s, available RAM %" PRIu32 " bytes (slot %d)\n",
-								scratchString.Pointer(),
+								scratchString.c_str(),
 								(srdBuf[slot].resetReason & (uint32_t)SoftwareResetReason::deliberate) ? "deliberate " : "",
 								reasonText, moduleName[srdBuf[slot].resetReason & 0x0F], srdBuf[slot].neverUsedRam, slot);
 			// Our format buffer is only 256 characters long, so the next 2 lines must be written separately
@@ -2237,7 +2121,7 @@ void Platform::Diagnostics(MessageType mtype)
 				{
 					scratchString.catf(" %08" PRIx32, srdBuf[slot].stack[i]);
 				}
-				MessageF(mtype, "Stack:%s\n", scratchString.Pointer());
+				MessageF(mtype, "Stack:%s\n", scratchString.c_str());
 			}
 		}
 		else
@@ -2546,8 +2430,8 @@ bool Platform::DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, int d)
 				}
 			}
 			reply.printf("Square roots: 62-bit %.2fus %s, 32-bit %.2fus %s\n",
-					(double)(tim1 * 10000)/DDA::stepClockRate, (ok1) ? "ok" : "ERROR",
-							(double)(tim2 * 10000)/DDA::stepClockRate, (ok2) ? "ok" : "ERROR");
+					(double)(tim1 * 10000)/StepClockRate, (ok1) ? "ok" : "ERROR",
+							(double)(tim2 * 10000)/StepClockRate, (ok2) ? "ok" : "ERROR");
 		}
 		break;
 
@@ -2562,38 +2446,6 @@ bool Platform::DiagnosticTest(GCodeBuffer& gb, const StringRef& reply, int d)
 	}
 
 	return false;
-}
-
-extern "C" uint32_t _estack;		// this is defined in the linker script
-
-// Return the stack usage and amount of memory that has never been used, in bytes
-void Platform::GetStackUsage(uint32_t* currentStack, uint32_t* maxStack, uint32_t* neverUsed) const
-{
-	const char * const ramend = (const char *)&_estack;
-	register const char * stack_ptr asm ("sp");
-	const char * const heapend = sbrk(0);
-	const char * stack_lwm = heapend;
-	while (stack_lwm < stack_ptr && *stack_lwm == memPattern)
-	{
-		++stack_lwm;
-	}
-	if (currentStack != nullptr) { *currentStack = ramend - stack_ptr; }
-	if (maxStack != nullptr) { *maxStack = ramend - stack_lwm; }
-	if (neverUsed != nullptr) { *neverUsed = stack_lwm - heapend; }
-}
-
-void Platform::ClassReport(uint32_t &lastTime)
-{
-	const Module spinningModule = reprap.GetSpinningModule();
-	if (reprap.Debug(spinningModule))
-	{
-		const uint32_t now = millis();
-		if (now - lastTime >= LongTime)
-		{
-			lastTime = now;
-			MessageF(UsbMessage, "Class %s spinning\n", moduleName[spinningModule]);
-		}
-	}
 }
 
 #if HAS_SMART_DRIVERS
@@ -2832,6 +2684,7 @@ bool Platform::WriteAxisLimits(FileStore *f, AxesBitmap axesProbed, const float 
 		return true;
 	}
 
+	String<ScratchStringLength> scratchString;
 	scratchString.printf("M208 S%d", sParam);
 	for (size_t axis = 0; axis < MaxAxes; ++axis)
 	{
@@ -2841,7 +2694,7 @@ bool Platform::WriteAxisLimits(FileStore *f, AxesBitmap axesProbed, const float 
 		}
 	}
 	scratchString.cat('\n');
-	return f->Write(scratchString.Pointer());
+	return f->Write(scratchString.c_str());
 }
 
 // This is called from the step ISR as well as other places, so keep it fast
@@ -3159,7 +3012,7 @@ bool Platform::SetDriverMicrostepping(size_t driver, unsigned int microsteps, in
 }
 
 // Set the microstepping, returning true if successful. All drivers for the same axis must use the same microstepping.
-bool Platform::SetMicrostepping(size_t drive, int microsteps, int mode)
+bool Platform::SetMicrostepping(size_t drive, int microsteps, bool interp)
 {
 	// Check that it is a valid microstepping number
 	const size_t numAxes = reprap.GetGCodes().GetTotalAxes();
@@ -3168,24 +3021,24 @@ bool Platform::SetMicrostepping(size_t drive, int microsteps, int mode)
 		bool ok = true;
 		for (size_t i = 0; i < axisDrivers[drive].numDrivers; ++i)
 		{
-			ok = SetDriverMicrostepping(axisDrivers[drive].driverNumbers[i], microsteps, mode) && ok;
+			ok = SetDriverMicrostepping(axisDrivers[drive].driverNumbers[i], microsteps, interp) && ok;
 		}
 		return ok;
 	}
 	else if (drive < DRIVES)
 	{
-		return SetDriverMicrostepping(extruderDrivers[drive - numAxes], microsteps, mode);
+		return SetDriverMicrostepping(extruderDrivers[drive - numAxes], microsteps, interp);
 	}
 	return false;
 }
 
 // Get the microstepping for a driver
-unsigned int Platform::GetDriverMicrostepping(size_t driver, int mode, bool& interpolation) const
+unsigned int Platform::GetDriverMicrostepping(size_t driver, bool& interpolation) const
 {
 #if HAS_SMART_DRIVERS
 	if (driver < numSmartDrivers)
 	{
-		return SmartDrivers::GetMicrostepping(driver, mode, interpolation);
+		return SmartDrivers::GetMicrostepping(driver, interpolation);
 	}
 	// On-board drivers only support x16 microstepping without interpolation
 	interpolation = false;
@@ -3200,16 +3053,16 @@ unsigned int Platform::GetDriverMicrostepping(size_t driver, int mode, bool& int
 }
 
 // Get the microstepping for an axis or extruder
-unsigned int Platform::GetMicrostepping(size_t drive, int mode, bool& interpolation) const
+unsigned int Platform::GetMicrostepping(size_t drive, bool& interpolation) const
 {
 	const size_t numAxes = reprap.GetGCodes().GetTotalAxes();
 	if (drive < numAxes)
 	{
-		return GetDriverMicrostepping(axisDrivers[drive].driverNumbers[0], mode, interpolation);
+		return GetDriverMicrostepping(axisDrivers[drive].driverNumbers[0], interpolation);
 	}
 	else if (drive < DRIVES)
 	{
-		return GetDriverMicrostepping(extruderDrivers[drive - numAxes], mode, interpolation);
+		return GetDriverMicrostepping(extruderDrivers[drive - numAxes], interpolation);
 	}
 	else
 	{
@@ -3276,7 +3129,7 @@ void Platform::SetDriverStepTiming(size_t driver, const float microseconds[4])
 		if (microseconds[i] > MinStepPulseTiming)
 		{
 			slowDriversBitmap |= CalcDriverBitmap(driver);		// this drive does need extended timing
-			const uint32_t clocks = (uint32_t)(((float)DDA::stepClockRate * microseconds[i] * 0.000001) + 0.99);	// convert microseconds to step clocks, rounding up
+			const uint32_t clocks = (uint32_t)(((float)StepClockRate * microseconds[i] * 0.000001) + 0.99);	// convert microseconds to step clocks, rounding up
 			if (clocks > slowDriverStepTimingClocks[i])
 			{
 				slowDriverStepTimingClocks[i] = clocks;
@@ -3291,7 +3144,7 @@ void Platform::GetDriverStepTiming(size_t driver, float microseconds[4]) const
 	for (size_t i = 0; i < 4; ++i)
 	{
 		microseconds[i] = (isSlowDriver)
-							? (float)slowDriverStepTimingClocks[i] * 1000000.0/(float)DDA::stepClockRate
+							? (float)slowDriverStepTimingClocks[i] * 1000000.0/(float)StepClockRate
 								: 0.0;
 	}
 }
@@ -3344,6 +3197,13 @@ void Platform::EnableSharedFan(bool enable)
 #endif
 
 
+// Check if the given fan can be controlled manually so that DWC can decide whether or not to show the corresponding fan
+// controls. This is the case if no thermostatic control is enabled and if the fan was configured at least once before.
+bool Platform::IsFanControllable(size_t fan) const
+{
+	return fan < NUM_FANS && !fans[fan].HasMonitoredHeaters() && fans[fan].IsConfigured();
+}
+
 // Get current fan RPM
 float Platform::GetFanRPM() const
 {
@@ -3351,9 +3211,9 @@ float Platform::GetFanRPM() const
 	// We get 2 tacho pulses per revolution, hence 2 interrupts per revolution.
 	// However, if the fan stops then we get no interrupts and fanInterval stops getting updated.
 	// We must recognise this and return zero.
-	return (fanInterval != 0 && micros() - fanLastResetTime < 3000000U)		// if we have a reading and it is less than 3 second old
-			? (float)((30000000U * fanMaxInterruptCount)/fanInterval)		// then calculate RPM assuming 2 interrupts per rev
-			: 0.0;															// else assume fan is off or tacho not connected
+	return (fanInterval != 0 && Platform::GetInterruptClocks() - fanLastResetTime < 3 * StepClockRate)	// if we have a reading and it is less than 3 second old
+			? (float)(3 * StepClockRate * fanMaxInterruptCount)/fanInterval		// then calculate RPM assuming 2 interrupts per rev
+			: 0.0;																// else assume fan is off or tacho not connected
 }
 
 bool Platform::FansHardwareInverted(size_t fanNumber) const
@@ -3427,6 +3287,7 @@ void Platform::AppendAuxReply(const char *msg, bool rawMessage)
 	// Discard this response if either no aux device is attached or if the response is empty
 	if (msg[0] != 0 && HaveAux())
 	{
+		MutexLocker lock(auxMutex);
 		if (rawMessage)
 		{
 			// Raw responses are sent directly to the AUX device
@@ -3434,7 +3295,7 @@ void Platform::AppendAuxReply(const char *msg, bool rawMessage)
 			if (OutputBuffer::Allocate(buf))
 			{
 				buf->copy(msg);
-				auxOutput->Push(buf);
+				auxOutput.Push(buf);
 			}
 		}
 		else
@@ -3456,23 +3317,27 @@ void Platform::AppendAuxReply(OutputBuffer *reply, bool rawMessage)
 	{
 		OutputBuffer::ReleaseAll(reply);
 	}
-	else if (rawMessage)
-	{
-		// JSON responses are always sent directly to the AUX device
-		// For big responses it makes sense to write big chunks of data in portions. Store this data here
-		auxOutput->Push(reply);
-	}
 	else
 	{
-		// Other responses are stored for M105/M408
-		auxSeq++;
-		if (auxGCodeReply == nullptr)
+		MutexLocker lock(auxMutex);
+		if (rawMessage)
 		{
-			auxGCodeReply = reply;
+			// JSON responses are always sent directly to the AUX device
+			// For big responses it makes sense to write big chunks of data in portions. Store this data here
+			auxOutput.Push(reply);
 		}
 		else
 		{
-			auxGCodeReply->Append(reply);
+			// Other responses are stored for M105/M408
+			auxSeq++;
+			if (auxGCodeReply == nullptr)
+			{
+				auxGCodeReply = reply;
+			}
+			else
+			{
+				auxGCodeReply->Append(reply);
+			}
 		}
 	}
 }
@@ -3493,7 +3358,7 @@ void Platform::RawMessage(MessageType type, const char *message)
 	}
 	else if ((type & LcdMessage) != 0)
 	{
-		AppendAuxReply(message, (message[0] == '{')  || (type & RawMessageFlag) != 0);
+		AppendAuxReply(message, message[0] == '{' || (type & RawMessageFlag) != 0);
 	}
 
 	if ((type & HttpMessage) != 0)
@@ -3509,11 +3374,12 @@ void Platform::RawMessage(MessageType type, const char *message)
 	if ((type & AuxMessage) != 0)
 	{
 #ifdef SERIAL_AUX2_DEVICE
+		MutexLocker lock(aux2Mutex);
 		// Message that is to be sent to the second auxiliary device (blocking)
-		if (!aux2Output->IsEmpty())
+		if (!aux2Output.IsEmpty())
 		{
 			// If we're still busy sending a response to the USART device, append this message to the output buffer
-			aux2Output->GetLastItem()->cat(message);
+			aux2Output.GetLastItem()->cat(message);
 		}
 		else
 		{
@@ -3527,6 +3393,7 @@ void Platform::RawMessage(MessageType type, const char *message)
 	if ((type & BlockingUsbMessage) != 0)
 	{
 		// Debug output sends messages in blocking mode. We now give up sending if we are close to software watchdog timeout.
+		MutexLocker lock(usbMutex);
 		const char *p = message;
 		size_t len = strlen(p);
 		while (SERIAL_MAIN_DEVICE && len != 0 && !reprap.SpinTimeoutImminent())
@@ -3540,12 +3407,13 @@ void Platform::RawMessage(MessageType type, const char *message)
 	else if ((type & UsbMessage) != 0)
 	{
 		// Message that is to be sent via the USB line (non-blocking)
+		MutexLocker lock(usbMutex);
 #if SUPPORT_SCANNER
 		if (!reprap.GetScanner().IsRegistered() || reprap.GetScanner().DoingGCodes())
 #endif
 		{
 			// Ensure we have a valid buffer to write to that isn't referenced for other destinations
-			OutputBuffer *usbOutputBuffer = usbOutput->GetLastItem();
+			OutputBuffer *usbOutputBuffer = usbOutput.GetLastItem();
 			if (usbOutputBuffer == nullptr || usbOutputBuffer->IsReferenced())
 			{
 				if (!OutputBuffer::Allocate(usbOutputBuffer))
@@ -3553,7 +3421,7 @@ void Platform::RawMessage(MessageType type, const char *message)
 					// Should never happen
 					return;
 				}
-				usbOutput->Push(usbOutputBuffer);
+				usbOutput.Push(usbOutputBuffer);
 			}
 
 			// Append the message string
@@ -3567,7 +3435,7 @@ void Platform::RawMessage(MessageType type, const char *message)
 // and calls to send an immediate LCD message the same as ordinary LCD messages
 void Platform::Message(const MessageType type, OutputBuffer *buffer)
 {
-	// First deal with logging because it doesn't hand on to the buffer
+	// First deal with logging because it doesn't hang on to the buffer
 	if ((type & LogMessage) != 0 && logger != nullptr)
 	{
 		logger->LogMessage(realTime, buffer);
@@ -3626,12 +3494,14 @@ void Platform::Message(const MessageType type, OutputBuffer *buffer)
 		if ((type & AuxMessage) != 0)
 		{
 			// Send this message to the second UART device
-			aux2Output->Push(buffer);
+			MutexLocker lock(aux2Mutex);
+			aux2Output.Push(buffer);
 		}
 #endif
 
 		if ((type & (UsbMessage | BlockingUsbMessage)) != 0)
 		{
+			MutexLocker lock(usbMutex);
 			if (   !SERIAL_MAIN_DEVICE
 #if SUPPORT_SCANNER
 				|| (reprap.GetScanner().IsRegistered() && !reprap.GetScanner().DoingGCodes())
@@ -3644,7 +3514,7 @@ void Platform::Message(const MessageType type, OutputBuffer *buffer)
 			else
 			{
 				// Else append incoming data to the stack
-				usbOutput->Push(buffer);
+				usbOutput.Push(buffer);
 			}
 		}
 	}
@@ -3652,8 +3522,7 @@ void Platform::Message(const MessageType type, OutputBuffer *buffer)
 
 void Platform::MessageF(MessageType type, const char *fmt, va_list vargs)
 {
-	char formatBuffer[FORMAT_STRING_LENGTH];
-	StringRef formatString(formatBuffer, ARRAY_SIZE(formatBuffer));
+	String<FORMAT_STRING_LENGTH> formatString;
 	if ((type & ErrorMessageFlag) != 0)
 	{
 		formatString.copy("Error: ");
@@ -3669,7 +3538,7 @@ void Platform::MessageF(MessageType type, const char *fmt, va_list vargs)
 		formatString.vprintf(fmt, vargs);
 	}
 
-	RawMessage((MessageType)(type & ~(ErrorMessageFlag | WarningMessageFlag)), formatBuffer);
+	RawMessage((MessageType)(type & ~(ErrorMessageFlag | WarningMessageFlag)), formatString.c_str());
 }
 
 void Platform::MessageF(MessageType type, const char *fmt, ...)
@@ -3688,11 +3557,10 @@ void Platform::Message(MessageType type, const char *message)
 	}
 	else
 	{
-		char formatBuffer[FORMAT_STRING_LENGTH];
-		StringRef formatString(formatBuffer, ARRAY_SIZE(formatBuffer));
+		String<FORMAT_STRING_LENGTH> formatString;
 		formatString.copy(((type & ErrorMessageFlag) != 0) ? "Error: " : "Warning: ");
 		formatString.cat(message);
-		RawMessage((MessageType)(type & ~(ErrorMessageFlag | WarningMessageFlag)), formatBuffer);
+		RawMessage((MessageType)(type & ~(ErrorMessageFlag | WarningMessageFlag)), formatString.c_str());
 	}
 }
 
@@ -4125,47 +3993,10 @@ bool Platform::SetExtrusionAncilliaryPwmPin(LogicalPin logicalPin, bool invert)
 }
 
 // CNC and laser support
-void Platform::SetSpindlePwm(float pwm)
-{
-	if (pwm >= 0)
-	{
-		spindleReversePort.WriteAnalog(0.0);
-		spindleForwardPort.WriteAnalog(pwm);
-	}
-	else
-	{
-		spindleForwardPort.WriteAnalog(0.0);
-		spindleReversePort.WriteAnalog(-pwm);
-	}
-}
 
 void Platform::SetLaserPwm(float pwm)
 {
 	laserPort.WriteAnalog(pwm);
-}
-
-bool Platform::SetSpindlePins(LogicalPin lpf, LogicalPin lpr, bool invert)
-{
-	const bool ok1 = spindleForwardPort.Set(lpf, PinAccess::pwm, invert);
-	if (lpr == NoLogicalPin)
-	{
-		spindleReversePort.Clear();
-		return ok1;
-	}
-	const bool ok2 = spindleReversePort.Set(lpr, PinAccess::pwm, invert);
-	return ok1 && ok2;
-}
-
-void Platform::GetSpindlePins(LogicalPin& lpf, LogicalPin& lpr, bool& invert) const
-{
-	lpf = spindleForwardPort.GetLogicalPin(invert);
-	lpr = spindleReversePort.GetLogicalPin();
-}
-
-void Platform::SetSpindlePwmFrequency(float freq)
-{
-	spindleForwardPort.SetFrequency(freq);
-	spindleReversePort.SetFrequency(freq);
 }
 
 bool Platform::SetLaserPin(LogicalPin lp, bool invert)
@@ -4598,18 +4429,18 @@ void STEP_TC_HANDLER()
 {
 	const irqflags_t flags = cpu_irq_save();
 	const int32_t diff = (int32_t)(tim - GetInterruptClocksInterruptsDisabled());	// see how long we have to go
-	if (diff < (int32_t)DDA::MinInterruptInterval)					// if less than about 6us or already passed
+	if (diff < (int32_t)DDA::MinInterruptInterval)						// if less than about 6us or already passed
 	{
 		cpu_irq_restore(flags);
-		return true;												// tell the caller to simulate an interrupt instead
+		return true;													// tell the caller to simulate an interrupt instead
 	}
 
-	STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_RA = tim;					// set up the compare register
+	STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_RA = tim;						// set up the compare register
 
 	// We would like to clear any pending step interrupt. To do this, we must read the TC status register.
 	// Unfortunately, this would clear any other pending interrupts from the same TC.
 	// So we don't, and the step ISR must allow for getting called prematurely.
-	STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_IER = TC_IER_CPAS;			// enable the interrupt
+	STEP_TC->TC_CHANNEL[STEP_TC_CHAN].TC_IER = TC_IER_CPAS;				// enable the interrupt
 	cpu_irq_restore(flags);
 
 #ifdef MOVE_DEBUG

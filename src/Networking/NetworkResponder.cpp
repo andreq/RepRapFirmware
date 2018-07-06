@@ -7,51 +7,22 @@
 
 #include "NetworkResponder.h"
 #include "Socket.h"
-
 #include "Platform.h"
-#include "OutputMemory.h"
-
-
-// NetworkResponderLock members
-
-// Acquire a lock
-bool NetworkResponderLock::Acquire(const NetworkResponder *who)
-{
-	if (owner == nullptr)
-	{
-		owner = who;
-		return true;
-	}
-	if (owner == who)
-	{
-		return true;
-	}
-	return false;
-}
-
-// Release a lock
-void NetworkResponderLock::Release(const NetworkResponder *who)
-{
-	if (owner == who)
-	{
-		owner = nullptr;
-	}
-}
 
 // NetworkResponder members
 
 NetworkResponder::NetworkResponder(NetworkResponder *n)
 	: next(n), responderState(ResponderState::free), skt(nullptr),
-	  outBuf(nullptr), outStack(new OutputStack), fileBeingSent(nullptr), fileBuffer(nullptr)
+	  outBuf(nullptr), fileBeingSent(nullptr), fileBuffer(nullptr)
 {
 }
 
 // Send the contents of the output buffers
-void NetworkResponder::Commit(ResponderState nextState)
+void NetworkResponder::Commit(ResponderState nextState, bool report)
 {
 	stateAfterSending = nextState;
 	responderState = ResponderState::sending;
-	if (reprap.Debug(moduleWebserver))
+	if (report && reprap.Debug(moduleWebserver))
 	{
 		debugPrintf("Sending reply, file = %s\n", (fileBeingSent != nullptr) ? "yes" : "no");
 	}
@@ -66,7 +37,7 @@ void NetworkResponder::SendData()
 	{
 		if (outBuf == nullptr)
 		{
-			outBuf = outStack->Pop();
+			outBuf = outStack.Pop();
 			if (outBuf == nullptr)
 			{
 				break;
@@ -178,8 +149,7 @@ void NetworkResponder::ConnectionLost()
 {
 	CancelUpload();
 	OutputBuffer::ReleaseAll(outBuf);
-	outBuf = nullptr;
-	outStack->ReleaseAll();
+	outStack.ReleaseAll();
 
 	if (fileBeingSent != nullptr)
 	{
@@ -268,6 +238,14 @@ void NetworkResponder::FinishUpload(uint32_t fileLength, time_t fileLastModified
 uint32_t NetworkResponder::GetRemoteIP() const
 {
 	return (skt == nullptr) ? 0 : skt->GetRemoteIP();
+}
+
+void NetworkResponder::ReportOutputBufferExhaustion(const char *sourceFile, int line)
+{
+	if (reprap.Debug(moduleWebserver))
+	{
+		debugPrintf("Ran out of output buffers at %s(%d)\n", sourceFile, line);
+	}
 }
 
 // End

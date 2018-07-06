@@ -216,9 +216,20 @@
 /* A header file that defines sync object types on the O/S, such as
 /  windows.h, ucos_ii.h and semphr.h, must be included prior to ff.h. */
 
-#define _FS_REENTRANT    0        /* 0:Disable or 1:Enable */
-#define _FS_TIMEOUT        1000    /* Timeout period in unit of time ticks */
-#define    _SYNC_t            HANDLE    /* O/S dependent type of sync object. e.g. HANDLE, OS_EVENT*, ID and etc.. */
+#ifdef RTOS
+
+struct Mutex;
+#define _FS_REENTRANT		1					/* 0:Disable or 1:Enable */
+#define _FS_TIMEOUT			1000				/* Timeout period in unit of time ticks */
+#define _SYNC_t				const struct Mutex*	/* O/S dependent type of sync object. e.g. HANDLE, OS_EVENT*, ID and etc.. */
+
+#else
+
+#define _FS_REENTRANT		0		/* 0:Disable or 1:Enable */
+#define _FS_TIMEOUT			1000	/* Timeout period in unit of time ticks */
+#define _SYNC_t				HANDLE	/* O/S dependent type of sync object. e.g. HANDLE, OS_EVENT*, ID and etc.. */
+
+#endif
 
 /* The _FS_REENTRANT option switches the reentrancy (thread safe) of the FatFs module.
 /

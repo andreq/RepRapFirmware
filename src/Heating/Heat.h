@@ -28,6 +28,7 @@ Licence: GPL
 #include "RepRapFirmware.h"
 #include "Pid.h"
 #include "MessageType.h"
+#include "GCodes/GCodeResult.h"
 
 class TemperatureSensor;
 class HeaterProtection;
@@ -40,7 +41,11 @@ public:
 	enum HeaterStatus { HS_off = 0, HS_standby = 1, HS_active = 2, HS_fault = 3, HS_tuning = 4 };
 
 	Heat(Platform& p);
+#ifdef RTOS
+	void Task();
+#else
 	void Spin();												// Called in a tight loop to keep everything going
+#endif
 	void Init();												// Set everything up
 	void Exit();												// Shut everything down
 	void ResetHeaterModels();									// Reset all active heater models to defaults
@@ -124,7 +129,7 @@ public:
 
 	int GetHeaterChannel(size_t heater) const;					// Return the channel used by a particular heater, or -1 if not configured
 	bool SetHeaterChannel(size_t heater, int channel);			// Set the channel used by a heater, returning true if bad heater or channel number
-	bool ConfigureHeaterSensor(size_t heater, unsigned int mcode, GCodeBuffer& gb, const StringRef& reply, bool& error);	// Configure the temperature sensor for a channel
+	GCodeResult ConfigureHeaterSensor(size_t heater, unsigned int mcode, GCodeBuffer& gb, const StringRef& reply);	// Configure the temperature sensor for a channel
 	const char *GetHeaterName(size_t heater) const;				// Get the name of a heater, or nullptr if it hasn't been named
 
 	HeaterProtection& AccessHeaterProtection(size_t index) const;	// Return the protection parameters of the given index
@@ -161,10 +166,13 @@ private:
 	TemperatureSensor *heaterSensors[Heaters];					// The sensor used by the real heaters
 	TemperatureSensor *virtualHeaterSensors[MaxVirtualHeaters];	// Sensors for virtual heaters
 
+#ifdef RTOS
+	uint32_t lastWakeTime;
+#else
 	uint32_t lastTime;											// The last time our Spin() was called
-	uint32_t longWait;											// Long time for things that happen occasionally
-
 	bool active;												// Are we active?
+#endif
+
 	bool coldExtrude;											// Is cold extrusion allowed?
 	int8_t bedHeaters[NumBedHeaters];							// Indices of the hot bed heaters to use or -1 if none is available
 	int8_t chamberHeaters[NumChamberHeaters];					// Indices of the chamber heaters to use or -1 if none is available

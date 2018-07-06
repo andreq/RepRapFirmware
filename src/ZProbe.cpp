@@ -34,8 +34,9 @@ float ZProbe::GetStopHeight(float temperature) const
 
 bool ZProbe::WriteParameters(FileStore *f, unsigned int probeType) const
 {
+	String<ScratchStringLength> scratchString;
 	scratchString.printf("G31 T%u P%" PRIu32 " X%.1f Y%.1f Z%.2f E%u\n", probeType, adcValue, (double)xOffset, (double)yOffset, (double)triggerHeight, eEndstop);
-	return f->Write(scratchString.Pointer());
+	return f->Write(scratchString.c_str());
 }
 
 // End

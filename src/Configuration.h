@@ -113,8 +113,8 @@ constexpr unsigned int FirstMax31855ThermocoupleChannel = 100;	// Temperature se
 constexpr unsigned int FirstMax31856ThermocoupleChannel = 150;	// Temperature sensor channels 150... are MAX31856 thermocouples
 constexpr unsigned int FirstRtdChannel = 200;			// Temperature sensor channels 200... are RTDs
 constexpr unsigned int FirstLinearAdcChannel = 300;		// Temperature sensor channels 300... use an ADC that provides a linear output over a temperature range
-constexpr unsigned int DhtTemperatureChannel = 400;		// Temperature sensor channel 400 for DHTxx temperature
-constexpr unsigned int DhtHumidityChannel = 401;		// Temperature sensor channel 401 for DHTxx humidity
+constexpr unsigned int FirstDhtTemperatureChannel = 400;	// Temperature sensor channel 400 for DHTxx temperature
+constexpr unsigned int FirstDhtHumidityChannel = 450;		// Temperature sensor channel 401 for DHTxx humidity
 constexpr unsigned int FirstPT1000Channel = 500;		// Temperature sensor channels 500... are PT1000 sensors connected to thermistor inputs
 constexpr unsigned int CpuTemperatureSenseChannel = 1000;  // Sensor 1000 is the MCJU's own temperature sensor
 constexpr unsigned int FirstTmcDriversSenseChannel = 1001; // Sensors 1001..1002 are the TMC2660 driver temperature sense
@@ -184,28 +184,32 @@ constexpr size_t GCODE_LENGTH = 101;					// maximum number of non-comment charac
 constexpr size_t MaxMessageLength = 256;
 
 #if SAM4E || SAM4S || SAME70
-constexpr size_t MaxFilenameLength = 120;					// Maximum length of a filename including the path
+constexpr size_t MaxFilenameLength = 120;				// Maximum length of a filename including the path
 #else
 constexpr size_t MaxFilenameLength = 100;
 #endif
 
 constexpr size_t MaxHeaterNameLength = 20;				// Maximum number of characters in a heater name
 
-// Output buffer lengths
+// Output buffer length and number of buffers
+// When using RTOS, it is best if it is possible to fit an HTTP response header in a single buffer. Our headers are currently about 230 bytes long.
+// A note on reserved buffers: the worst case is when a GCode with a long response is processed. After string the response, there must be enough buffer space
+// for the HTTP responder to return a status response. Otherwise DWC never gets to know that it needs to make a rr_reply call and the system deadlocks.
 #if SAM4E || SAM4S || SAME70
-constexpr uint16_t OUTPUT_BUFFER_SIZE = 256;			// How many bytes does each OutputBuffer hold?
-constexpr size_t OUTPUT_BUFFER_COUNT = 32;				// How many OutputBuffer instances do we have?
-constexpr size_t RESERVED_OUTPUT_BUFFERS = 1;			// Number of reserved output buffers after long responses. Must be enough for an HTTP header
+constexpr size_t OUTPUT_BUFFER_SIZE = 256;				// How many bytes does each OutputBuffer hold?
+constexpr size_t OUTPUT_BUFFER_COUNT = 20;				// How many OutputBuffer instances do we have?
+constexpr size_t RESERVED_OUTPUT_BUFFERS = 4;			// Number of reserved output buffers after long responses, enough to hold a status response
 #elif SAM3XA
-constexpr uint16_t OUTPUT_BUFFER_SIZE = 128;			// How many bytes does each OutputBuffer hold?
-constexpr size_t OUTPUT_BUFFER_COUNT = 32;				// How many OutputBuffer instances do we have?
-constexpr size_t RESERVED_OUTPUT_BUFFERS = 2;			// Number of reserved output buffers after long responses. Must be enough for an HTTP header
+constexpr size_t OUTPUT_BUFFER_SIZE = 256;				// How many bytes does each OutputBuffer hold?
+constexpr size_t OUTPUT_BUFFER_COUNT = 16;				// How many OutputBuffer instances do we have?
+constexpr size_t RESERVED_OUTPUT_BUFFERS = 2;			// Number of reserved output buffers after long responses
 #else
 # error
 #endif
 
 // Move system
-constexpr float DefaultFeedrate = 3000.0;				// The initial requested feed rate after resetting the printer, in mm/min
+constexpr float DefaultFeedRate = 3000.0;				// The initial requested feed rate after resetting the printer, in mm/min
+constexpr float DefaultG0FeedRate = 18000;				// The initial feed rate for G0 commands after resetting the printer, in mm/min
 constexpr float DefaultRetractSpeed = 1000.0;			// The default firmware retraction and un-retraction speed, in mm
 constexpr float DefaultRetractLength = 2.0;
 constexpr float MinimumMovementSpeed = 0.5;				// The minimum movement speed (extruding moves will go slower than this if the extrusion rate demands it)
@@ -228,12 +232,13 @@ constexpr float FILAMENT_WIDTH = 1.75;					// Millimetres
 constexpr unsigned int MaxStackDepth = 5;				// Maximum depth of stack
 
 // CNC and laser support
+constexpr size_t MaxSpindles = 4;						// Maximum number of configurable spindles
 constexpr float DefaultMaxSpindleRpm = 10000;			// Default spindle RPM at full PWM
 constexpr float DefaultMaxLaserPower = 255.0;			// Power setting in M3 command for full power
 
 // File handling
 constexpr size_t MAX_FILES = 10;						// Must be large enough to handle the max number of simultaneous web requests + files being printed
-constexpr size_t FILE_BUFFER_SIZE = 256;
+constexpr size_t FILE_BUFFER_SIZE = 128;
 
 // Webserver stuff
 #define DEFAULT_PASSWORD		"reprap"				// Default machine password
@@ -251,9 +256,10 @@ constexpr size_t FILE_BUFFER_SIZE = 256;
 #define MACRO_DIR "0:/macros/"						// Ditto - Macro files
 #define SCANS_DIRECTORY "0:/scans/"					// Directory for uploaded 3D scans
 #define FILAMENTS_DIRECTORY "0:/filaments/"			// Directory for filament configurations
+#define MENU_DIR "0:/menu/"							// Directory for menu files
 
 #define CONFIG_FILE "config.g"
-#define DEFAULT_FILE "default.g"
+#define CONFIG_BACKUP_FILE "config.g.bak"
 #define DEFAULT_LOG_FILE "eventlog.txt"
 
 #define EOF_STRING "<!-- **EoF** -->"

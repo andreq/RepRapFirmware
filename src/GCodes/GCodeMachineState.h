@@ -17,7 +17,7 @@ enum class GCodeState : uint8_t
 	normal,												// not doing anything and ready to process a new GCode
 
 	waitingForSpecialMoveToComplete,					// doing a special move, so we must wait for it to finish before processing another GCode
-	waitingForArcMoveToComplete,						// doing an arc move, so we must check whether it completes normally
+	waitingForSegmentedMoveToGo,						// doing an arc move, so we must check whether it completes normally
 
 	probingToolOffset,
 
@@ -50,23 +50,25 @@ enum class GCodeState : uint8_t
 	stopping,
 	sleeping,
 
-	// These next 7 must be contiguous
+	// These next 9 must be contiguous
 	gridProbing1,
 	gridProbing2a,
 	gridProbing2b,
 	gridProbing3,
 	gridProbing4,
+	gridProbing4a,
 	gridProbing5,
 	gridProbing6,
 	gridProbing7,
 
-	// These next 9 must be contiguous
+	// These next 10 must be contiguous
 	probingAtPoint0,
 	probingAtPoint1,
 	probingAtPoint2a,
 	probingAtPoint2b,
 	probingAtPoint3,
 	probingAtPoint4,
+	probingAtPoint4a,
 	probingAtPoint5,
 	probingAtPoint6,
 	probingAtPoint7,
@@ -89,7 +91,7 @@ public:
 	GCodeMachineState();
 
 	GCodeMachineState *previous;
-	float feedrate;
+	float feedRate;
 	FileData fileState;
 	ResourceBitmap lockedResources;
 	const char *errorMessage;
@@ -119,7 +121,7 @@ public:
 	{
 		drivesRelative = other.drivesRelative;
 		axesRelative = other.axesRelative;
-		feedrate = other.feedrate;
+		feedRate = other.feedRate;
 	}
 
 	static void Release(GCodeMachineState *ms);

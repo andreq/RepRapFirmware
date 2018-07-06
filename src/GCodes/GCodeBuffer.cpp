@@ -15,8 +15,8 @@
 
 // Create a default GCodeBuffer
 GCodeBuffer::GCodeBuffer(const char* id, MessageType mt, bool usesCodeQueue)
-	: machineState(new GCodeMachineState()), identity(id), checksumRequired(false), writingFileDirectory(nullptr),
-	  toolNumberAdjust(0), responseMessageType(mt), queueCodes(usesCodeQueue), binaryWriting(false)
+	: machineState(new GCodeMachineState()), identity(id), writingFileDirectory(nullptr),
+	  toolNumberAdjust(0), responseMessageType(mt), checksumRequired(false), queueCodes(usesCodeQueue), binaryWriting(false)
 {
 	Init();
 }
@@ -39,6 +39,7 @@ void GCodeBuffer::Init()
 
 void GCodeBuffer::Diagnostics(MessageType mtype)
 {
+	String<ScratchStringLength> scratchString;
 	switch (bufferState)
 	{
 	case GCodeBufferState::parseNotStarted:
@@ -66,7 +67,7 @@ void GCodeBuffer::Diagnostics(MessageType mtype)
 	}
 	while (ms != nullptr);
 	scratchString.cat('\n');
-	reprap.GetPlatform().Message(mtype, scratchString.Pointer());
+	reprap.GetPlatform().Message(mtype, scratchString.c_str());
 }
 
 inline void GCodeBuffer::AddToChecksum(char c)
@@ -261,7 +262,7 @@ bool GCodeBuffer::LineFinished()
 	{
 		if (hadLineNumber)
 		{
-			snprintf(gcodeBuffer, ARRAY_SIZE(gcodeBuffer), "M998 P%u", lineNumber);	// request resend
+			SafeSnprintf(gcodeBuffer, ARRAY_SIZE(gcodeBuffer), "M998 P%u", lineNumber);	// request resend
 		}
 		else
 		{
@@ -436,7 +437,7 @@ float GCodeBuffer::GetFValue()
 {
 	if (readPointer >= 0)
 	{
-		const float result = (float) strtod(&gcodeBuffer[readPointer + 1], 0);
+		const float result = SafeStrtof(&gcodeBuffer[readPointer + 1], 0);
 		readPointer = -1;
 		return result;
 	}
@@ -452,8 +453,8 @@ const void GCodeBuffer::GetFloatArray(float arr[], size_t& returnedLength, bool 
 	if (readPointer >= 0)
 	{
 		size_t length = 0;
-		bool inList = true;
-		while (inList)
+		const char *p = gcodeBuffer + readPointer + 1;
+		for (;;)
 		{
 			if (length >= returnedLength)		// array limit has been set in here
 			{
@@ -462,16 +463,14 @@ const void GCodeBuffer::GetFloatArray(float arr[], size_t& returnedLength, bool 
 				returnedLength = 0;
 				return;
 			}
-			arr[length] = (float)strtod(&gcodeBuffer[readPointer + 1], 0);
+			const char *q;
+			arr[length] = SafeStrtof(p, &q);
 			length++;
-			do
+			if (*q != LIST_SEPARATOR)
 			{
-				readPointer++;
-			} while(gcodeBuffer[readPointer] && (gcodeBuffer[readPointer] != ' ') && (gcodeBuffer[readPointer] != LIST_SEPARATOR));
-			if (gcodeBuffer[readPointer] != LIST_SEPARATOR)
-			{
-				inList = false;
+				break;
 			}
+			p = q + 1;
 		}
 
 		// Special case if there is one entry and returnedLength requests several. Fill the array with the first entry.
@@ -502,8 +501,8 @@ const void GCodeBuffer::GetIntArray(int32_t arr[], size_t& returnedLength, bool 
 	if (readPointer >= 0)
 	{
 		size_t length = 0;
-		bool inList = true;
-		while(inList)
+		const char *p = gcodeBuffer + readPointer + 1;
+		for (;;)
 		{
 			if (length >= returnedLength) // Array limit has been set in here
 			{
@@ -512,16 +511,14 @@ const void GCodeBuffer::GetIntArray(int32_t arr[], size_t& returnedLength, bool 
 				returnedLength = 0;
 				return;
 			}
-			arr[length] = strtol(&gcodeBuffer[readPointer + 1], 0, 0);
+			const char *q;
+			arr[length] = SafeStrtol(p, &q);
 			length++;
-			do
+			if (*q != LIST_SEPARATOR)
 			{
-				readPointer++;
-			} while(gcodeBuffer[readPointer] != 0 && (gcodeBuffer[readPointer] != ' ') && (gcodeBuffer[readPointer] != LIST_SEPARATOR));
-			if (gcodeBuffer[readPointer] != LIST_SEPARATOR)
-			{
-				inList = false;
+				break;
 			}
+			p = q + 1;
 		}
 
 		// Special case if there is one entry and returnedLength requests several. Fill the array with the first entry.
@@ -551,8 +548,8 @@ const void GCodeBuffer::GetUnsignedArray(uint32_t arr[], size_t& returnedLength,
 	if (readPointer >= 0)
 	{
 		size_t length = 0;
-		bool inList = true;
-		while(inList)
+		const char *p = gcodeBuffer + readPointer + 1;
+		for (;;)
 		{
 			if (length >= returnedLength) // Array limit has been set in here
 			{
@@ -561,16 +558,14 @@ const void GCodeBuffer::GetUnsignedArray(uint32_t arr[], size_t& returnedLength,
 				returnedLength = 0;
 				return;
 			}
-			arr[length] = strtoul(&gcodeBuffer[readPointer + 1], 0, 0);
+			const char *q;
+			arr[length] = SafeStrtoul(p, &q);
 			length++;
-			do
+			if (*q != LIST_SEPARATOR)
 			{
-				readPointer++;
-			} while(gcodeBuffer[readPointer] != 0 && (gcodeBuffer[readPointer] != ' ') && (gcodeBuffer[readPointer] != LIST_SEPARATOR));
-			if (gcodeBuffer[readPointer] != LIST_SEPARATOR)
-			{
-				inList = false;
+				break;
 			}
+			p = q + 1;
 		}
 
 		// Special case if there is one entry and returnedLength requests several. Fill the array with the first entry.
@@ -702,7 +697,7 @@ int32_t GCodeBuffer::GetIValue()
 {
 	if (readPointer >= 0)
 	{
-		const int32_t result = strtol(&gcodeBuffer[readPointer + 1], 0, 0);
+		const int32_t result = SafeStrtol(&gcodeBuffer[readPointer + 1]);
 		readPointer = -1;
 		return result;
 	}
@@ -716,7 +711,7 @@ uint32_t GCodeBuffer::GetUIValue()
 {
 	if (readPointer >= 0)
 	{
-		const uint32_t result = strtoul(&gcodeBuffer[readPointer + 1], 0, 0);
+		const uint32_t result = SafeStrtoul(&gcodeBuffer[readPointer + 1]);
 		readPointer = -1;
 		return result;
 	}
@@ -751,6 +746,16 @@ void GCodeBuffer::TryGetUIValue(char c, uint32_t& val, bool& seen)
 	if (Seen(c))
 	{
 		val = GetUIValue();
+		seen = true;
+	}
+}
+
+// If the specified parameter character is found, fetch 'value' as a Boolean and set 'seen'. Otherwise leave val and seen alone.
+void GCodeBuffer::TryGetBValue(char c, bool& val, bool& seen)
+{
+	if (Seen(c))
+	{
+		val = GetIValue() > 0;
 		seen = true;
 	}
 }
@@ -814,8 +819,8 @@ bool GCodeBuffer::GetIPAddress(uint8_t ip[4])
 	unsigned int n = 0;
 	for (;;)
 	{
-		char *pp;
-		const unsigned long v = strtoul(p, &pp, 10);
+		const char *pp;
+		const unsigned long v = SafeStrtoul(p, &pp);
 		if (pp == p || v > 255)
 		{
 			readPointer = -1;
@@ -866,12 +871,12 @@ bool GCodeBuffer::GetMacAddress(uint8_t mac[6])
 		return false;
 	}
 
-	const char* p = &gcodeBuffer[readPointer + 1];
+	const char* p = gcodeBuffer + readPointer + 1;
 	unsigned int n = 0;
 	for (;;)
 	{
-		char *pp;
-		const unsigned long v = strtoul(p, &pp, 16);
+		const char *pp;
+		const unsigned long v = SafeStrtoul(p, &pp, 16);
 		if (pp == p || v > 255)
 		{
 			readPointer = -1;
@@ -922,7 +927,7 @@ bool GCodeBuffer::PushState()
 
 	GCodeMachineState * const ms = GCodeMachineState::Allocate();
 	ms->previous = machineState;
-	ms->feedrate = machineState->feedrate;
+	ms->feedRate = machineState->feedRate;
 	ms->fileState.CopyFrom(machineState->fileState);
 	ms->lockedResources = machineState->lockedResources;
 	ms->drivesRelative = machineState->drivesRelative;
