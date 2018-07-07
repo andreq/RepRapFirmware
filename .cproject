@@ -353,7 +353,7 @@
 					<stringMacro name="LinkFlags2" type="VALUE_TEXT" value="-Wl,--end-group -lm"/>
 					<stringMacro name="LinkFlags1" type="VALUE_TEXT" value="-mthumb -Wl,--cref -Wl,--check-sections -Wl,--gc-sections -Wl,--entry=Reset_Handler -Wl,--unresolved-symbols=report-all -Wl,--warn-common -Wl,--warn-section-align -Wl,--warn-unresolved-symbols -Wl,--start-group"/>
 					<stringMacro name="CoreName" type="VALUE_TEXT" value="CoreNG"/>
-					<stringMacro name="GccPath" type="VALUE_TEXT" value="C:\Program Files (x86)\GNU Tools ARM Embedded\6 2017-q2-update\bin"/>
+					<stringMacro name="GccPath" type="VALUE_TEXT" value="C:\Program Files (x86)\GNU Tools ARM Embedded\7 2017-q4-major\bin"/>
 				</macros>
 				<externalSettings/>
 				<extensions>
@@ -593,7 +593,7 @@
 					<stringMacro name="LinkFlags2" type="VALUE_TEXT" value="-Wl,--end-group -lm"/>
 					<stringMacro name="LinkFlags1" type="VALUE_TEXT" value="-mthumb -Wl,--cref -Wl,--check-sections -Wl,--gc-sections -Wl,--entry=Reset_Handler -Wl,--unresolved-symbols=report-all -Wl,--warn-common -Wl,--warn-section-align -Wl,--warn-unresolved-symbols -Wl,--start-group"/>
 					<stringMacro name="CoreName" type="VALUE_TEXT" value="CoreNG"/>
-					<stringMacro name="GccPath" type="VALUE_TEXT" value="C:\Program Files (x86)\GNU Tools ARM Embedded\6 2017-q2-update\bin"/>
+					<stringMacro name="GccPath" type="VALUE_TEXT" value="C:\Program Files (x86)\GNU Tools ARM Embedded\7 2017-q4-major\bin"/>
 				</macros>
 				<externalSettings/>
 				<extensions>
@@ -731,6 +731,7 @@
 		<configuration configurationName="Alligator"/>
 		<configuration configurationName="SAME70_RTOS"/>
 		<configuration configurationName="SAME70"/>
+		<configuration configurationName="Duet2"/>
 		<configuration configurationName="RADDS"/>
 		<configuration configurationName="Duet2_RTOS"/>
 		<configuration configurationName="Duet2"/>
